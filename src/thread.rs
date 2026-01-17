@@ -10,15 +10,16 @@ use std::{
 use agent_client_protocol::{
     Annotations, AudioContent, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
     BlobResourceContents, Client, ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock,
-    ContentChunk, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ImageContent,
-    LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan,
-    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
-    SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
-    TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    ContentChunk, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ExtRequest, ExtResponse,
+    ImageContent, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    RawValue, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
+    SessionMode, SessionModeId, SessionModeState, SessionModelState, SessionNotification,
+    SessionUpdate, StopReason, Terminal, TextContent, TextResourceContents, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
@@ -35,9 +36,9 @@ use codex_core::{
         McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
         Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        ReviewTarget, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TurnAbortedEvent,
-        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
-        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        ReviewTarget, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent,
+        TokenUsageInfo, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
@@ -54,7 +55,7 @@ use codex_protocol::{
 use heck::ToTitleCase;
 use itertools::Itertools;
 use mcp_types::{CallToolResult, RequestId};
-use serde_json::json;
+use serde_json::{json, value::to_raw_value};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
@@ -65,6 +66,21 @@ use crate::{
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
+const USAGE_METHOD: &str = "lody:session_usage_update";
+
+#[derive(Debug, serde::Serialize)]
+pub struct SessionUsage {
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SessionUsageUpdate {
+    usage: SessionUsage,
+    // model_usage:
+}
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
 #[async_trait::async_trait]
@@ -615,11 +631,39 @@ impl PromptState {
                 }
             }
 
+            // TODO: rate_limits
+            // In the future we can use this to update usage stats
+            EventMsg::TokenCount(TokenCountEvent{info, rate_limits:_}) =>{
+                if let Some(TokenUsageInfo{total_token_usage:_, last_token_usage, model_context_window:_}) = info{
+                    let raw_value = match to_raw_value(&SessionUsageUpdate{
+                        usage: SessionUsage { 
+                            input_tokens: last_token_usage.input_tokens, 
+                            output_tokens: last_token_usage.output_tokens, 
+                            cache_read_input_tokens: last_token_usage.cached_input_tokens, 
+                            reasoning_output_tokens: last_token_usage.reasoning_output_tokens
+                         }
+                    }){
+                        Ok(v)=>v,
+                        Err(err)=>{
+                            if let Some(response_tx) = self.response_tx.take() {
+                                drop(response_tx.send(Err(err.into())));
+                            }
+                            return;
+                        }
+                    };
+                     
+                    let response =  client.ext_method(ExtRequest::new(
+                        USAGE_METHOD, Arc::from(raw_value)
+                     )).await;
+                     if let Err(err) = response && let Some(response_tx) = self.response_tx.take() {
+                        drop(response_tx.send(Err(err)));
+                    }
+                }
+            }
+
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
             | EventMsg::ThreadRolledBack(..)
-            // In the future we can use this to update usage stats
-            | EventMsg::TokenCount(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
@@ -1601,6 +1645,10 @@ impl SessionClient {
                 options,
             ))
             .await
+    }
+
+    async fn ext_method(&self, args: ExtRequest) -> Result<ExtResponse, Error> {
+        self.client.ext_method(args).await
     }
 }
 

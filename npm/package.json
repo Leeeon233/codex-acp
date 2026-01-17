@@ -1,17 +1,17 @@
 {
-  "name": "@zed-industries/codex-acp",
+  "name": "acp-extension-codex",
   "version": "0.8.2",
   "type": "module",
   "description": "An ACP-compatible coding agent powered by Codex",
   "license": "Apache-2.0",
-  "author": "Zed <hi@zed.dev>",
-  "homepage": "https://github.com/zed-industries/codex-acp",
+  "author": "lody <agent@lody.ai>",
+  "homepage": "https://github.com/Leeeon233/acp-extension",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zed-industries/codex-acp.git"
+    "url": "git+https://github.com/Leeeon233/acp-extension.git"
   },
   "bugs": {
-    "url": "https://github.com/zed-industries/codex-acp/issues"
+    "url": "https://github.com/Leeeon233/acp-extension/issues"
   },
   "keywords": [
     "codex",
