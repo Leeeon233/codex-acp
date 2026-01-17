@@ -8,19 +8,20 @@ import { fileURLToPath } from "node:url";
 function getPlatformPackage() {
   const platform = process.platform;
   const arch = process.arch;
+  const baseName = "acp-extension-codex";
 
   const platformMap = {
     darwin: {
-      arm64: "codex-acp-darwin-arm64",
-      x64: "codex-acp-darwin-x64",
+      arm64: `${baseName}-darwin-arm64`,
+      x64: `${baseName}-darwin-x64`,
     },
     linux: {
-      arm64: "codex-acp-linux-arm64",
-      x64: "codex-acp-linux-x64",
+      arm64: `${baseName}-linux-arm64`,
+      x64: `${baseName}-linux-x64`,
     },
     win32: {
-      arm64: "codex-acp-win32-arm64",
-      x64: "codex-acp-win32-x64",
+      arm64: `${baseName}-win32-arm64`,
+      x64: `${baseName}-win32-x64`,
     },
   };
 
@@ -36,7 +37,7 @@ function getPlatformPackage() {
     process.exit(1);
   }
 
-  return `@zed-industries/${packageName}`;
+  return packageName;
 }
 
 // Locate the binary

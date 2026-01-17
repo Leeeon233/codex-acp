@@ -10,16 +10,16 @@ function getPlatformPackage() {
 
   const platformMap = {
     darwin: {
-      arm64: "codex-acp-darwin-arm64",
-      x64: "codex-acp-darwin-x64",
+      arm64: "acp-extension-codex-darwin-arm64",
+      x64: "acp-extension-codex-darwin-x64",
     },
     linux: {
-      arm64: "codex-acp-linux-arm64",
-      x64: "codex-acp-linux-x64",
+      arm64: "acp-extension-codex-linux-arm64",
+      x64: "acp-extension-codex-linux-x64",
     },
     win32: {
-      arm64: "codex-acp-win32-arm64",
-      x64: "codex-acp-win32-x64",
+      arm64: "acp-extension-codex-win32-arm64",
+      x64: "acp-extension-codex-win32-x64",
     },
   };
 
@@ -41,12 +41,12 @@ function getPlatformPackage() {
 // Test all known platform/arch combinations
 function testAllPlatforms() {
   const testCases = [
-    { platform: "darwin", arch: "arm64", expected: "codex-acp-darwin-arm64" },
-    { platform: "darwin", arch: "x64", expected: "codex-acp-darwin-x64" },
-    { platform: "linux", arch: "arm64", expected: "codex-acp-linux-arm64" },
-    { platform: "linux", arch: "x64", expected: "codex-acp-linux-x64" },
-    { platform: "win32", arch: "arm64", expected: "codex-acp-win32-arm64" },
-    { platform: "win32", arch: "x64", expected: "codex-acp-win32-x64" },
+    { platform: "darwin", arch: "arm64", expected: "acp-extension-codex-darwin-arm64" },
+    { platform: "darwin", arch: "x64", expected: "acp-extension-codex-darwin-x64" },
+    { platform: "linux", arch: "arm64", expected: "acp-extension-codex-linux-arm64" },
+    { platform: "linux", arch: "x64", expected: "acp-extension-codex-linux-x64" },
+    { platform: "win32", arch: "arm64", expected: "acp-extension-codex-win32-arm64" },
+    { platform: "win32", arch: "x64", expected: "acp-extension-codex-win32-x64" },
   ];
 
   console.log("Testing platform detection logic...\n");

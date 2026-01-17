@@ -7,8 +7,10 @@ set -euo pipefail
 # Usage: update-base-package.sh <version>
 
 VERSION="${1:?Missing version}"
+NPM_BASE_NAME="${NPM_BASE_NAME:-acp-extension-codex}"
 
 echo "Updating base package.json to version $VERSION..."
+echo "Base package name: $NPM_BASE_NAME"
 
 # Find the package.json relative to this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,19 +21,33 @@ if [[ ! -f "$PACKAGE_JSON" ]]; then
   exit 1
 fi
 
-# Update version in base package.json
-sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$PACKAGE_JSON"
+PACKAGE_JSON="$PACKAGE_JSON" VERSION="$VERSION" NPM_BASE_NAME="$NPM_BASE_NAME" node --input-type=module - <<'NODE'
+import fs from "node:fs";
 
-# Update optionalDependencies versions
-sed -i.bak "s/\"codex-acp-darwin-arm64\": \".*\"/\"codex-acp-darwin-arm64\": \"$VERSION\"/" "$PACKAGE_JSON"
-sed -i.bak "s/\"codex-acp-darwin-x64\": \".*\"/\"codex-acp-darwin-x64\": \"$VERSION\"/" "$PACKAGE_JSON"
-sed -i.bak "s/\"codex-acp-linux-arm64\": \".*\"/\"codex-acp-linux-arm64\": \"$VERSION\"/" "$PACKAGE_JSON"
-sed -i.bak "s/\"codex-acp-linux-x64\": \".*\"/\"codex-acp-linux-x64\": \"$VERSION\"/" "$PACKAGE_JSON"
-sed -i.bak "s/\"codex-acp-win32-arm64\": \".*\"/\"codex-acp-win32-arm64\": \"$VERSION\"/" "$PACKAGE_JSON"
-sed -i.bak "s/\"codex-acp-win32-x64\": \".*\"/\"codex-acp-win32-x64\": \"$VERSION\"/" "$PACKAGE_JSON"
+const pkgPath = process.env.PACKAGE_JSON;
+const version = process.env.VERSION;
+const baseName = process.env.NPM_BASE_NAME;
 
-# Remove backup file
-rm -f "$PACKAGE_JSON.bak"
+if (!pkgPath) throw new Error("Missing PACKAGE_JSON");
+if (!version) throw new Error("Missing VERSION");
+if (!baseName) throw new Error("Missing NPM_BASE_NAME");
+
+const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+pkg.name = baseName;
+pkg.version = version;
+
+const platformPkgs = [
+  `${baseName}-darwin-arm64`,
+  `${baseName}-darwin-x64`,
+  `${baseName}-linux-arm64`,
+  `${baseName}-linux-x64`,
+  `${baseName}-win32-arm64`,
+  `${baseName}-win32-x64`,
+];
+
+pkg.optionalDependencies = Object.fromEntries(platformPkgs.map((n) => [n, version]));
+fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
+NODE
 
 echo "✅ Updated package.json:"
 cat "$PACKAGE_JSON"

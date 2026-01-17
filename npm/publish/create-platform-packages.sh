@@ -9,11 +9,13 @@ set -euo pipefail
 ARTIFACTS_DIR="${1:?Missing artifacts directory}"
 OUTPUT_DIR="${2:?Missing output directory}"
 VERSION="${3:?Missing version}"
+NPM_BASE_NAME="${NPM_BASE_NAME:-acp-extension-codex}"
 
 echo "Creating platform-specific npm packages..."
 echo "Artifacts: $ARTIFACTS_DIR"
 echo "Output: $OUTPUT_DIR"
 echo "Version: $VERSION"
+echo "Base package: $NPM_BASE_NAME"
 echo
 
 mkdir -p "$OUTPUT_DIR"
@@ -50,7 +52,7 @@ for target in "${!platforms[@]}"; do
   echo "📦 Processing $target from $(basename "$archive_path")"
 
   # Create package name
-  pkg_name="codex-acp-${os}-${arch}"
+  pkg_name="${NPM_BASE_NAME}-${os}-${arch}"
   pkg_dir="$OUTPUT_DIR/${pkg_name}"
   mkdir -p "${pkg_dir}/bin"
 

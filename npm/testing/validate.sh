@@ -76,12 +76,12 @@ echo
 # 5. Verify optional dependencies list
 echo "5. Verifying platform packages..."
 EXPECTED_PACKAGES=(
-  "@zed-industries/codex-acp-darwin-arm64"
-  "@zed-industries/codex-acp-darwin-x64"
-  "@zed-industries/codex-acp-linux-arm64"
-  "@zed-industries/codex-acp-linux-x64"
-  "@zed-industries/codex-acp-win32-arm64"
-  "@zed-industries/codex-acp-win32-x64"
+  "acp-extension-codex-darwin-arm64"
+  "acp-extension-codex-darwin-x64"
+  "acp-extension-codex-linux-arm64"
+  "acp-extension-codex-linux-x64"
+  "acp-extension-codex-win32-arm64"
+  "acp-extension-codex-win32-x64"
 )
 
 missing_packages=0
