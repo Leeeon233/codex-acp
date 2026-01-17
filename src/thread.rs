@@ -13,7 +13,7 @@ use agent_client_protocol::{
     ContentChunk, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ExtRequest, ExtResponse,
     ImageContent, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption,
     PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-    RawValue, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
     SessionMode, SessionModeId, SessionModeState, SessionModelState, SessionNotification,
@@ -69,6 +69,7 @@ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const USAGE_METHOD: &str = "lody:session_usage_update";
 
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionUsage {
     input_tokens: i64,
     output_tokens: i64,
@@ -77,6 +78,7 @@ pub struct SessionUsage {
 }
 
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionUsageUpdate {
     usage: SessionUsage,
     // model_usage:
