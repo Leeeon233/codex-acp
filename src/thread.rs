@@ -8,18 +8,7 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Annotations, AudioContent, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
-    BlobResourceContents, Client, ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock,
-    ContentChunk, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ExtRequest, ExtResponse,
-    ImageContent, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
-    SessionMode, SessionModeId, SessionModeState, SessionModelState, SessionNotification,
-    SessionUpdate, StopReason, Terminal, TextContent, TextResourceContents, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    Annotations, AudioContent, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, BlobResourceContents, Client, ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource, EmbeddedResourceResource, Error, ExtRequest, ExtResponse, ImageContent, LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RawValue, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput
 };
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
@@ -28,17 +17,7 @@ use codex_core::{
     error::CodexErr,
     models_manager::manager::ModelsManager,
     protocol::{
-        AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction,
-        ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
-        ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange,
-        ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
-        Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
-        ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        ReviewTarget, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent,
-        TokenUsageInfo, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
-        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent, AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange, ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, Op, PatchApplyBeginEvent, PatchApplyEndEvent, RateLimitSnapshot, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TokenUsageInfo, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent
     },
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
@@ -66,7 +45,8 @@ use crate::{
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
-const USAGE_METHOD: &str = "lody:session_usage_update";
+const USAGE_METHOD: &str = "acp_ext:session_usage_update";
+const RATE_LIMITS_METHOD: &str = "acp_ext:session_rate_limits";
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -633,16 +613,15 @@ impl PromptState {
                 }
             }
 
-            // TODO: rate_limits
             // In the future we can use this to update usage stats
-            EventMsg::TokenCount(TokenCountEvent{info, rate_limits:_}) =>{
-                if let Some(TokenUsageInfo{total_token_usage:_, last_token_usage, model_context_window:_}) = info{
+            EventMsg::TokenCount(TokenCountEvent{info, rate_limits}) =>{
+                if let Some(TokenUsageInfo{total_token_usage, last_token_usage:_, model_context_window:_}) = info{
                     let raw_value = match to_raw_value(&SessionUsageUpdate{
                         usage: SessionUsage { 
-                            input_tokens: last_token_usage.input_tokens, 
-                            output_tokens: last_token_usage.output_tokens, 
-                            cache_read_input_tokens: last_token_usage.cached_input_tokens, 
-                            reasoning_output_tokens: last_token_usage.reasoning_output_tokens
+                            input_tokens: total_token_usage.input_tokens, 
+                            output_tokens: total_token_usage.output_tokens, 
+                            cache_read_input_tokens: total_token_usage.cached_input_tokens, 
+                            reasoning_output_tokens: total_token_usage.reasoning_output_tokens
                          }
                     }){
                         Ok(v)=>v,
@@ -658,6 +637,24 @@ impl PromptState {
                         USAGE_METHOD, Arc::from(raw_value)
                      )).await;
                      if let Err(err) = response && let Some(response_tx) = self.response_tx.take() {
+                        drop(response_tx.send(Err(err)));
+                    }
+                }
+
+                if let Some(rate_limits) = rate_limits{
+                    let raw_value = match serde_json::to_string(&rate_limits).and_then(|json|{
+                        RawValue::from_string(json)
+                    }){
+                        Ok(v)=>v,
+                        Err(err)=>{
+                            if let Some(response_tx) = self.response_tx.take() {
+                                drop(response_tx.send(Err(err.into())));
+                            }
+                            return;
+                        }
+                    };
+                    let response = client.ext_method(ExtRequest::new(RATE_LIMITS_METHOD, Arc::from(raw_value))).await;
+                    if let Err(err) = response && let Some(response_tx) = self.response_tx.take() {
                         drop(response_tx.send(Err(err)));
                     }
                 }
