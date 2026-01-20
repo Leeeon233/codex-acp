@@ -56,6 +56,16 @@ Or via npm:
 npx acp-extension-codex
 ```
 
+## Local release pack (no publish)
+
+To locally reproduce the `release.yml` packaging flow for `aarch64-apple-darwin` (Apple Silicon) without publishing to npm:
+
+```
+bash script/local-release-aarch64-apple-darwin.sh
+```
+
+This produces two tarballs under `npm-packages/.local-release/<timestamp>/packs/` (the base package and the `darwin-arm64` platform package).
+
 ## License
 
 Apache-2.0

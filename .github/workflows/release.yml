@@ -108,7 +108,7 @@ jobs:
           APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
           APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
         run: |
-          ./script/sign-mac target/${{ matrix.target }}/release/codex-acp
+          ./script/sign-mac target/${{ matrix.target }}/release/acp-extension-codex
 
       - name: Code sign Windows binary
         if: startsWith(matrix.os, 'windows')
@@ -123,14 +123,14 @@ jobs:
           TIMESTAMP_DIGEST: SHA256
           TIMESTAMP_SERVER: http://timestamp.acs.microsoft.com
         run: |
-          .\script\sign-windows.ps1 target\${{ matrix.target }}\release\codex-acp.exe
+          .\script\sign-windows.ps1 target\${{ matrix.target }}\release\acp-extension-codex.exe
 
       - name: Create archive
         id: create_archive
         shell: bash
         run: |
-          BINARY_NAME="codex-acp${{ matrix.binary_extension }}"
-          ARCHIVE_NAME="codex-acp-${{ needs.get-version.outputs.version }}-${{ matrix.target }}"
+          BINARY_NAME="acp-extension-codex${{ matrix.binary_extension }}"
+          ARCHIVE_NAME="acp-extension-codex-${{ needs.get-version.outputs.version }}-${{ matrix.target }}"
 
           cd target/${{ matrix.target }}/release
 

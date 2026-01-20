@@ -10,7 +10,7 @@
     "url": "git+https://github.com/Leeeon233/acp-extension.git"
   },
   "bin": {
-    "acp-extension-codex": "bin/acp-extension-codex"
+    "${PACKAGE_NAME}": "bin/acp-extension-codex"
   },
   "scripts": {
     "prepack": "node ./ensure-executable.mjs",

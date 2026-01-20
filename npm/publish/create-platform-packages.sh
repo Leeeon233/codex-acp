@@ -10,12 +10,16 @@ ARTIFACTS_DIR="${1:?Missing artifacts directory}"
 OUTPUT_DIR="${2:?Missing output directory}"
 VERSION="${3:?Missing version}"
 NPM_BASE_NAME="${NPM_BASE_NAME:-acp-extension-codex}"
+ONLY_TARGET="${ONLY_TARGET:-}"
 
 echo "Creating platform-specific npm packages..."
 echo "Artifacts: $ARTIFACTS_DIR"
 echo "Output: $OUTPUT_DIR"
 echo "Version: $VERSION"
 echo "Base package: $NPM_BASE_NAME"
+if [[ -n "$ONLY_TARGET" ]]; then
+  echo "Only target: $ONLY_TARGET"
+fi
 echo
 
 mkdir -p "$OUTPUT_DIR"
@@ -33,6 +37,9 @@ platforms=(
 
 for entry in "${platforms[@]}"; do
   IFS=":" read -r target os arch ext <<< "$entry"
+  if [[ -n "$ONLY_TARGET" && "$target" != "$ONLY_TARGET" ]]; then
+    continue
+  fi
 
   # Determine archive extension
   if [[ "$os" == "win32" ]]; then
