@@ -12,6 +12,10 @@
   "bin": {
     "acp-extension-codex": "bin/acp-extension-codex"
   },
+  "scripts": {
+    "prepack": "node ./ensure-executable.mjs",
+    "postinstall": "node ./ensure-executable.mjs"
+  },
   "os": [
     "${OS}"
   ],
@@ -19,6 +23,7 @@
     "${ARCH}"
   ],
   "files": [
-    "bin"
+    "bin",
+    "ensure-executable.mjs"
   ]
 }

@@ -20,19 +20,19 @@ echo
 
 mkdir -p "$OUTPUT_DIR"
 
-# Define platform mappings: target -> (npm-os, npm-arch, binary-extension)
+# Define platform mappings: target:os:arch:binary-extension
 # Note: We only package gnu variants for Linux
-declare -A platforms=(
-  ["aarch64-apple-darwin"]="darwin arm64 "
-  ["x86_64-apple-darwin"]="darwin x64 "
-  ["x86_64-unknown-linux-gnu"]="linux x64 "
-  ["aarch64-unknown-linux-gnu"]="linux arm64 "
-  ["x86_64-pc-windows-msvc"]="win32 x64 .exe"
-  ["aarch64-pc-windows-msvc"]="win32 arm64 .exe"
+platforms=(
+  "aarch64-apple-darwin:darwin:arm64:"
+  "x86_64-apple-darwin:darwin:x64:"
+  "x86_64-unknown-linux-gnu:linux:x64:"
+  "aarch64-unknown-linux-gnu:linux:arm64:"
+  "x86_64-pc-windows-msvc:win32:x64:.exe"
+  "aarch64-pc-windows-msvc:win32:arm64:.exe"
 )
 
-for target in "${!platforms[@]}"; do
-  read os arch ext <<< "${platforms[$target]}"
+for entry in "${platforms[@]}"; do
+  IFS=":" read -r target os arch ext <<< "$entry"
 
   # Determine archive extension
   if [[ "$os" == "win32" ]]; then
@@ -64,7 +64,13 @@ for target in "${!platforms[@]}"; do
   fi
 
   # Make binary executable (important for Unix-like systems)
-  chmod +x "${pkg_dir}/bin/acp-extension-codex${ext}" 2>/dev/null || echo "Failed to make binary executable"
+  if [[ "$os" != "win32" ]]; then
+    chmod 755 "${pkg_dir}/bin/acp-extension-codex${ext}"
+    if [[ ! -x "${pkg_dir}/bin/acp-extension-codex${ext}" ]]; then
+      echo "❌ Error: binary is not executable: ${pkg_dir}/bin/acp-extension-codex${ext}"
+      exit 1
+    fi
+  fi
 
   # Create package.json from template
   export PACKAGE_NAME="$pkg_name"
@@ -75,8 +81,37 @@ for target in "${!platforms[@]}"; do
   # Find the template relative to this script
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   TEMPLATE_PATH="$SCRIPT_DIR/../template/package.json"
+  TEMPLATE_SCRIPT="$SCRIPT_DIR/../template/ensure-executable.mjs"
 
-  envsubst < "$TEMPLATE_PATH" > "${pkg_dir}/package.json"
+  if command -v envsubst >/dev/null 2>&1; then
+    envsubst < "$TEMPLATE_PATH" > "${pkg_dir}/package.json"
+  else
+    TEMPLATE_PATH="$TEMPLATE_PATH" OUT_PATH="${pkg_dir}/package.json" node - <<'NODE'
+const fs = require("fs");
+
+const templatePath = process.env.TEMPLATE_PATH;
+const outPath = process.env.OUT_PATH;
+const required = ["PACKAGE_NAME", "VERSION", "OS", "ARCH"];
+for (const k of required) {
+  if (!process.env[k]) throw new Error(`Missing ${k}`);
+}
+const vars = {
+  PACKAGE_NAME: process.env.PACKAGE_NAME,
+  VERSION: process.env.VERSION,
+  OS: process.env.OS,
+  ARCH: process.env.ARCH,
+};
+
+let s = fs.readFileSync(templatePath, "utf8");
+for (const [k, v] of Object.entries(vars)) {
+  s = s.split(`\${${k}}`).join(v);
+}
+fs.writeFileSync(outPath, s);
+NODE
+  fi
+
+  # Copy helper script used by prepack/postinstall (best-effort chmod fallback)
+  cp "$TEMPLATE_SCRIPT" "${pkg_dir}/ensure-executable.mjs"
 
   # Update bin field for Windows to include .exe extension
   if [[ "$os" == "win32" ]]; then

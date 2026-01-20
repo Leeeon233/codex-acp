@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { chmodSync, existsSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 // Map Node.js platform/arch to package names
@@ -69,9 +69,24 @@ function getBinaryPath() {
   process.exit(1);
 }
 
+function ensureExecutable(binaryPath) {
+  if (process.platform === "win32") return;
+
+  try {
+    const st = statSync(binaryPath);
+    // If it has no execute bits, add them (preserve existing mode bits).
+    if ((st.mode & 0o111) === 0) {
+      chmodSync(binaryPath, st.mode | 0o111);
+    }
+  } catch {
+    // Best-effort: if we can't stat/chmod, spawnSync will surface the error.
+  }
+}
+
 // Execute the binary
 function run() {
   const binaryPath = getBinaryPath();
+  ensureExecutable(binaryPath);
   const result = spawnSync(binaryPath, process.argv.slice(2), {
     stdio: "inherit",
     windowsHide: true,
