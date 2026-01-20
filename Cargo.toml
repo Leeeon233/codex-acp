@@ -11,7 +11,7 @@ name = "acp-extension-codex"
 path = "src/main.rs"
 
 [lib]
-name = "acp-extension-codex"
+name = "acp_extension_codex"
 path = "src/lib.rs"
 
 [dependencies]

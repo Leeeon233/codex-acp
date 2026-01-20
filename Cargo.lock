@@ -13,6 +13,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "acp-extension-codex"
+version = "0.8.5"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "clap",
+ "codex-apply-patch",
+ "codex-arg0",
+ "codex-common",
+ "codex-core",
+ "codex-login",
+ "codex-mcp-server",
+ "codex-protocol",
+ "heck",
+ "itertools 0.14.0",
+ "mcp-types",
+ "regex-lite",
+ "serde",
+ "serde_json",
+ "shlex",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -701,34 +729,6 @@ name = "cmp_any"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9b18233253483ce2f65329a24072ec414db782531bdbb7d0bbc4bd2ce6b7e21"
-
-[[package]]
-name = "codex-acp"
-version = "0.8.4"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "async-trait",
- "clap",
- "codex-apply-patch",
- "codex-arg0",
- "codex-common",
- "codex-core",
- "codex-login",
- "codex-mcp-server",
- "codex-protocol",
- "heck",
- "itertools 0.14.0",
- "mcp-types",
- "regex-lite",
- "serde",
- "serde_json",
- "shlex",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "codex-api"
