@@ -10,7 +10,7 @@
     "url": "git+https://github.com/Leeeon233/acp-extension.git"
   },
   "bin": {
-    "codex-acp": "bin/codex-acp"
+    "acp-extension-codex": "bin/acp-extension-codex"
   },
   "os": [
     "${OS}"

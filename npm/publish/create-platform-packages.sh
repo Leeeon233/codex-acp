@@ -58,13 +58,13 @@ for target in "${!platforms[@]}"; do
 
   # Extract binary
   if [[ "$archive_ext" == "zip" ]]; then
-    unzip -q -j "$archive_path" "codex-acp${ext}" -d "${pkg_dir}/bin/"
+    unzip -q -j "$archive_path" "acp-extension-codex${ext}" -d "${pkg_dir}/bin/"
   else
-    tar xzf "$archive_path" -C "${pkg_dir}/bin/" "codex-acp${ext}"
+    tar xzf "$archive_path" -C "${pkg_dir}/bin/" "acp-extension-codex${ext}"
   fi
 
   # Make binary executable (important for Unix-like systems)
-  chmod +x "${pkg_dir}/bin/codex-acp${ext}" 2>/dev/null || echo "Failed to make binary executable"
+  chmod +x "${pkg_dir}/bin/acp-extension-codex${ext}" 2>/dev/null || echo "Failed to make binary executable"
 
   # Create package.json from template
   export PACKAGE_NAME="$pkg_name"
@@ -81,7 +81,7 @@ for target in "${!platforms[@]}"; do
   # Update bin field for Windows to include .exe extension
   if [[ "$os" == "win32" ]]; then
     # Use sed to update the bin path in package.json
-    sed -i.bak 's|"bin/codex-acp"|"bin/codex-acp.exe"|' "${pkg_dir}/package.json"
+    sed -i.bak 's|"bin/acp-extension-codex"|"bin/acp-extension-codex.exe"|' "${pkg_dir}/package.json"
     rm "${pkg_dir}/package.json.bak"
   fi
 

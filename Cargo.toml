@@ -1,17 +1,17 @@
 [package]
-name = "codex-acp"
-version = "0.8.4"
+name = "acp-extension-codex"
+version = "0.8.5"
 edition = "2024"
 authors = ["lody <agent@lody.ai>"]
 license = "Apache-2.0"
 description = "An ACP-compatible coding agent powered by Codex"
 
 [[bin]]
-name = "codex-acp"
+name = "acp-extension-codex"
 path = "src/main.rs"
 
 [lib]
-name = "codex_acp"
+name = "acp-extension-codex"
 path = "src/lib.rs"
 
 [dependencies]

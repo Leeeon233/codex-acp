@@ -42,18 +42,18 @@ Or try it with any of the other [ACP compatible clients](https://agentclientprot
 
 #### Installation
 
-Install the adapter from the latest release for your architecture and OS: https://github.com/zed-industries/codex-acp/releases
+Install the adapter from the latest release for your architecture and OS: https://github.com/Leeeon233/acp-extension/releases
 
-You can then use `codex-acp` as a regular ACP agent:
+You can then use `acp-extension-codex` as a regular ACP agent:
 
 ```
-OPENAI_API_KEY=sk-... codex-acp
+OPENAI_API_KEY=sk-... acp-extension-codex
 ```
 
 Or via npm:
 
 ```
-npx @zed-industries/codex-acp
+npx acp-extension-codex
 ```
 
 ## License

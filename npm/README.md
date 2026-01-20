@@ -44,10 +44,10 @@ Read the docs on [External Agent](https://zed.dev/docs/ai/external-agents) suppo
 
 Install the adapter from the latest release for your architecture and OS: https://github.com/Leeeon233/acp-extension/releases
 
-You can then use `codex-acp` as a regular ACP agent:
+You can then use `acp-extension-codex` as a regular ACP agent:
 
 ```
-OPENAI_API_KEY=sk-... codex-acp
+OPENAI_API_KEY=sk-... acp-extension-codex
 ```
 
 Or via npm:

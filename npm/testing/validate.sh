@@ -24,7 +24,7 @@ check_command grep
 
 # 1. Validate wrapper script syntax
 echo "1. Validating wrapper script syntax..."
-if node -c npm/bin/codex-acp.js 2>/dev/null; then
+if node -c npm/bin/acp-extension-codex.js 2>/dev/null; then
   echo -e "${GREEN}✓ Wrapper script syntax is valid${NC}"
 else
   echo -e "${RED}✗ Wrapper script has syntax errors${NC}"

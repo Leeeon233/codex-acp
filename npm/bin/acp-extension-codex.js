@@ -44,7 +44,9 @@ function getPlatformPackage() {
 function getBinaryPath() {
   const packageName = getPlatformPackage();
   const binaryName =
-    process.platform === "win32" ? "codex-acp.exe" : "codex-acp";
+    process.platform === "win32"
+      ? "acp-extension-codex.exe"
+      : "acp-extension-codex";
 
   try {
     // Try to resolve the platform-specific package
