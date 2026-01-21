@@ -65,6 +65,16 @@ pub struct SessionUsageUpdate {
     // model_usage:
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RaceLimitUpdate {
+    plan_name: Option<String>,
+    five_hour: Option<f64>,
+    seven_day: Option<f64>,
+    five_hour_reset_at: Option<i64>,
+    seven_day_reset_at: Option<i64>,
+}
+
 /// Trait for abstracting over the `CodexThread` to make testing easier.
 #[async_trait::async_trait]
 pub trait CodexThreadImpl {
@@ -644,7 +654,15 @@ impl PromptState {
                 }
 
                 if let Some(rate_limits) = rate_limits{
-                    let raw_value = match serde_json::to_string(&rate_limits).and_then(|json|{
+                    let primary = rate_limits.primary.as_ref();
+                    let secondary = rate_limits.secondary.as_ref();
+                    let raw_value = match serde_json::to_string(&RaceLimitUpdate{
+                        five_hour: primary.map(|r|r.used_percent),
+                        five_hour_reset_at: primary.map(|r|r.resets_at).flatten(),
+                        seven_day: secondary.map(|r|r.used_percent),
+                        seven_day_reset_at: secondary.map(|r|r.resets_at).flatten(),
+                        plan_name: rate_limits.plan_type.map(|p|serde_json::to_string(&p).unwrap())
+                    }).and_then(|json|{
                         RawValue::from_string(json)
                     }){
                         Ok(v)=>v,
