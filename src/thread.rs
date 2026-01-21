@@ -55,6 +55,7 @@ pub struct SessionUsage {
     output_tokens: i64,
     cache_read_input_tokens: i64,
     reasoning_output_tokens: i64,
+    context_window: Option<i64>
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -615,13 +616,14 @@ impl PromptState {
 
             // In the future we can use this to update usage stats
             EventMsg::TokenCount(TokenCountEvent{info, rate_limits}) =>{
-                if let Some(TokenUsageInfo{total_token_usage, last_token_usage:_, model_context_window:_}) = info{
+                if let Some(TokenUsageInfo{total_token_usage, last_token_usage:_, model_context_window}) = info{
                     let raw_value = match to_raw_value(&SessionUsageUpdate{
                         usage: SessionUsage { 
                             input_tokens: total_token_usage.input_tokens, 
                             output_tokens: total_token_usage.output_tokens, 
                             cache_read_input_tokens: total_token_usage.cached_input_tokens, 
-                            reasoning_output_tokens: total_token_usage.reasoning_output_tokens
+                            reasoning_output_tokens: total_token_usage.reasoning_output_tokens,
+                            context_window: model_context_window
                          }
                     }){
                         Ok(v)=>v,
