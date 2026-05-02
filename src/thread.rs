@@ -65,10 +65,10 @@ use codex_protocol::{
         NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
         PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
         ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem,
-        StreamErrorEvent, TerminalInteractionEvent, ThreadGoal, ThreadGoalStatus, TokenCountEvent,
-        TokenUsageInfo, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
-        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
-        validate_thread_goal_objective,
+        StreamErrorEvent, TerminalInteractionEvent, ThreadGoal, ThreadGoalStatus,
+        ThreadGoalUpdatedEvent, TokenCountEvent, TokenUsageInfo, TurnAbortedEvent,
+        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent, validate_thread_goal_objective,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -123,6 +123,8 @@ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const FAST_MODE_CONFIG_ID: &str = "fast_mode";
 const USAGE_METHOD: &str = "acp_ext:session_usage_update";
 const RATE_LIMITS_METHOD: &str = "acp_ext:session_rate_limits";
+const THREAD_GOAL_UPDATED_METHOD: &str = "acp_ext:thread_goal_updated";
+const THREAD_GOAL_CLEARED_METHOD: &str = "acp_ext:thread_goal_cleared";
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -151,6 +153,48 @@ pub struct RaceLimitUpdate {
     seven_day: Option<f64>,
     five_hour_reset_at: Option<i64>,
     seven_day_reset_at: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadGoalPayload {
+    thread_id: String,
+    objective: String,
+    status: ThreadGoalStatus,
+    token_budget: Option<i64>,
+    tokens_used: i64,
+    time_used_seconds: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl From<&ThreadGoal> for ThreadGoalPayload {
+    fn from(goal: &ThreadGoal) -> Self {
+        Self {
+            thread_id: goal.thread_id.to_string(),
+            objective: goal.objective.clone(),
+            status: goal.status,
+            token_budget: goal.token_budget,
+            tokens_used: goal.tokens_used,
+            time_used_seconds: goal.time_used_seconds,
+            created_at: goal.created_at,
+            updated_at: goal.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadGoalUpdatedNotification {
+    thread_id: String,
+    turn_id: Option<String>,
+    goal: ThreadGoalPayload,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadGoalClearedNotification {
+    thread_id: String,
 }
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
@@ -1471,6 +1515,17 @@ impl PromptState {
                 );
                 self.guardian_assessment(client, event);
             }
+            EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                thread_id,
+                turn_id,
+                goal,
+            }) => {
+                info!(
+                    "Thread goal updated: thread_id={thread_id}, turn_id={turn_id:?}, status={:?}",
+                    goal.status
+                );
+                client.send_thread_goal_updated(&thread_id, turn_id, &goal);
+            }
 
             // Ignore these events
             EventMsg::ImageGenerationBegin(..)
@@ -1479,7 +1534,6 @@ impl PromptState {
             | EventMsg::ThreadRolledBack(..)
             | EventMsg::HookStarted(..)
             | EventMsg::HookCompleted(..)
-            | EventMsg::ThreadGoalUpdated(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
@@ -2630,6 +2684,43 @@ impl SessionClient {
         }
     }
 
+    fn send_json_ext_notification<T: serde::Serialize>(&self, method: &str, params: &T) {
+        let raw_value = match to_raw_value(params) {
+            Ok(value) => value,
+            Err(err) => {
+                error!("Failed to serialize ext notification params for {method}: {err}");
+                return;
+            }
+        };
+
+        self.send_ext_notification(method, Arc::from(raw_value));
+    }
+
+    fn send_thread_goal_updated(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: Option<String>,
+        goal: &ThreadGoal,
+    ) {
+        self.send_json_ext_notification(
+            THREAD_GOAL_UPDATED_METHOD,
+            &ThreadGoalUpdatedNotification {
+                thread_id: thread_id.to_string(),
+                turn_id,
+                goal: goal.into(),
+            },
+        );
+    }
+
+    fn send_thread_goal_cleared(&self, thread_id: &ThreadId) {
+        self.send_json_ext_notification(
+            THREAD_GOAL_CLEARED_METHOD,
+            &ThreadGoalClearedNotification {
+                thread_id: thread_id.to_string(),
+            },
+        );
+    }
+
     fn send_user_message(&self, text: impl Into<String>) {
         self.send_notification(SessionUpdate::UserMessageChunk(ContentChunk::new(
             text.into().into(),
@@ -2806,7 +2897,11 @@ impl<A: Auth> ThreadActor<A> {
         match message {
             ThreadMessage::Load { response_tx } => {
                 let result = self.handle_load().await;
+                let should_emit_goal_snapshot = result.is_ok();
                 drop(response_tx.send(result));
+                if should_emit_goal_snapshot {
+                    self.maybe_emit_thread_goal_snapshot().await;
+                }
                 let client = self.client.clone();
                 let commands = self.builtin_commands();
                 // Have this happen after the session is loaded by putting it
@@ -3311,6 +3406,33 @@ impl<A: Auth> ThreadActor<A> {
             .config_options(self.config_options().await?))
     }
 
+    async fn maybe_emit_thread_goal_snapshot(&self) {
+        if !self.config.features.enabled(Feature::Goals) {
+            return;
+        }
+
+        let Some(thread_id) = self.thread_id else {
+            warn!("Skipping thread goal snapshot: ACP session id is not a valid Codex thread id");
+            return;
+        };
+        let Some(state_db) = self.thread.state_db() else {
+            warn!("Skipping thread goal snapshot: sqlite state db unavailable");
+            return;
+        };
+
+        match state_db.get_thread_goal(thread_id).await {
+            Ok(Some(goal)) => {
+                let goal = protocol_thread_goal_from_state(goal);
+                self.client
+                    .send_thread_goal_updated(&thread_id, None, &goal);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!("Failed to read thread goal snapshot: {err}");
+            }
+        }
+    }
+
     async fn handle_prompt(
         &mut self,
         request: PromptRequest,
@@ -3528,6 +3650,8 @@ impl<A: Auth> ThreadActor<A> {
 
         self.thread.apply_external_goal_set(goal.status).await;
         let goal = protocol_thread_goal_from_state(goal);
+        self.client
+            .send_thread_goal_updated(&thread_id, None, &goal);
         let action = if replacing {
             "Goal replaced"
         } else {
@@ -3563,6 +3687,8 @@ impl<A: Auth> ThreadActor<A> {
 
         self.thread.apply_external_goal_set(goal.status).await;
         let goal = protocol_thread_goal_from_state(goal);
+        self.client
+            .send_thread_goal_updated(&thread_id, None, &goal);
         Ok(format!(
             "Goal {}.\n{}",
             thread_goal_status_label(goal.status),
@@ -3583,6 +3709,7 @@ impl<A: Auth> ThreadActor<A> {
 
         if cleared {
             self.thread.apply_external_goal_clear().await;
+            self.client.send_thread_goal_cleared(&thread_id);
             Ok("Goal cleared.".to_string())
         } else {
             Ok("No goal to clear. This thread does not currently have a goal.".to_string())
@@ -4578,6 +4705,20 @@ mod tests {
             }) if text.contains("Goal set.") && text.contains("improve benchmark coverage")
         ));
 
+        let ext_notifications = client.ext_notifications.lock().unwrap();
+        assert_eq!(ext_notifications.len(), 1);
+        assert_eq!(
+            ext_notifications[0].method.as_ref(),
+            "_acp_ext:thread_goal_updated"
+        );
+        let params: serde_json::Value = serde_json::from_str(ext_notifications[0].params.get())?;
+        assert_eq!(params["threadId"], thread_id.to_string());
+        assert!(params["turnId"].is_null());
+        assert_eq!(params["goal"]["threadId"], thread_id.to_string());
+        assert_eq!(params["goal"]["objective"], "improve benchmark coverage");
+        assert_eq!(params["goal"]["status"], "active");
+        assert!(params["goal"]["tokenBudget"].is_null());
+
         Ok(())
     }
 
@@ -4642,6 +4783,80 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+
+        let ext_notifications = client.ext_notifications.lock().unwrap();
+        assert_eq!(ext_notifications.len(), 3);
+        assert_eq!(
+            ext_notifications[0].method.as_ref(),
+            "_acp_ext:thread_goal_updated"
+        );
+        assert_eq!(
+            ext_notifications[1].method.as_ref(),
+            "_acp_ext:thread_goal_updated"
+        );
+        assert_eq!(
+            ext_notifications[2].method.as_ref(),
+            "_acp_ext:thread_goal_cleared"
+        );
+        let pause_params: serde_json::Value =
+            serde_json::from_str(ext_notifications[0].params.get())?;
+        let resume_params: serde_json::Value =
+            serde_json::from_str(ext_notifications[1].params.get())?;
+        let clear_params: serde_json::Value =
+            serde_json::from_str(ext_notifications[2].params.get())?;
+        assert_eq!(pause_params["goal"]["status"], "paused");
+        assert_eq!(resume_params["goal"]["status"], "active");
+        assert_eq!(clear_params["threadId"], thread_id.to_string());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_thread_goal_updated_event_sends_ext_notification() -> anyhow::Result<()> {
+        let thread_id = ThreadId::new();
+        let session_id = SessionId::new(thread_id.to_string());
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (resolution_tx, _resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let mut state =
+            PromptState::new("submission".to_string(), thread, resolution_tx, response_tx);
+
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                    thread_id,
+                    turn_id: Some("turn-1".to_string()),
+                    goal: ThreadGoal {
+                        thread_id,
+                        objective: "keep shipping".to_string(),
+                        status: ThreadGoalStatus::BudgetLimited,
+                        token_budget: Some(42_000),
+                        tokens_used: 21_000,
+                        time_used_seconds: 123,
+                        created_at: 1_000,
+                        updated_at: 2_000,
+                    },
+                }),
+            )
+            .await;
+
+        let ext_notifications = client.ext_notifications.lock().unwrap();
+        assert_eq!(ext_notifications.len(), 1);
+        assert_eq!(
+            ext_notifications[0].method.as_ref(),
+            "_acp_ext:thread_goal_updated"
+        );
+        let params: serde_json::Value = serde_json::from_str(ext_notifications[0].params.get())?;
+        assert_eq!(params["threadId"], thread_id.to_string());
+        assert_eq!(params["turnId"], "turn-1");
+        assert_eq!(params["goal"]["objective"], "keep shipping");
+        assert_eq!(params["goal"]["status"], "budgetLimited");
+        assert_eq!(params["goal"]["tokenBudget"], 42_000);
+        assert_eq!(params["goal"]["tokensUsed"], 21_000);
+        assert_eq!(params["goal"]["timeUsedSeconds"], 123);
 
         Ok(())
     }
