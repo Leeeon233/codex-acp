@@ -33,9 +33,11 @@ use codex_core::{
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
+use codex_features::Feature;
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
+    ThreadId,
     approvals::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
@@ -44,7 +46,7 @@ use codex_protocol::{
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     mcp::CallToolResult,
-    models::{PermissionProfile, ResponseItem, WebSearchAction},
+    models::{AdditionalPermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     permissions::{
@@ -62,10 +64,11 @@ use codex_protocol::{
         McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
         NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
         PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
-        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SandboxPolicy,
-        StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent, TokenUsageInfo,
-        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem,
+        StreamErrorEvent, TerminalInteractionEvent, ThreadGoal, ThreadGoalStatus, TokenCountEvent,
+        TokenUsageInfo, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        validate_thread_goal_objective,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -73,6 +76,7 @@ use codex_protocol::{
     },
     user_input::UserInput,
 };
+use codex_rollout::state_db::StateDbHandle;
 use codex_shell_command::parse_command::parse_command;
 use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
 use heck::ToTitleCase;
@@ -154,6 +158,13 @@ pub trait CodexThreadImpl: Send + Sync {
     fn submit(&self, op: Op)
     -> Pin<Box<dyn Future<Output = Result<String, CodexErr>> + Send + '_>>;
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>>;
+    fn state_db(&self) -> Option<StateDbHandle>;
+    fn prepare_external_goal_mutation(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    fn apply_external_goal_set(
+        &self,
+        status: codex_state::ThreadGoalStatus,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    fn apply_external_goal_clear(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 impl CodexThreadImpl for CodexThread {
@@ -167,6 +178,25 @@ impl CodexThreadImpl for CodexThread {
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>> {
         Box::pin(self.next_event())
     }
+
+    fn state_db(&self) -> Option<StateDbHandle> {
+        self.state_db()
+    }
+
+    fn prepare_external_goal_mutation(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.prepare_external_goal_mutation())
+    }
+
+    fn apply_external_goal_set(
+        &self,
+        status: codex_state::ThreadGoalStatus,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.apply_external_goal_set(status))
+    }
+
+    fn apply_external_goal_clear(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.apply_external_goal_clear())
+    }
 }
 
 pub trait ModelsManagerImpl: Send + Sync {
@@ -177,32 +207,46 @@ pub trait ModelsManagerImpl: Send + Sync {
     fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>>;
 }
 
-impl ModelsManagerImpl for ModelsManager {
+pub struct ModelsManagerAdapter {
+    inner: Arc<dyn ModelsManager>,
+}
+
+impl ModelsManagerAdapter {
+    pub fn new(inner: Arc<dyn ModelsManager>) -> Arc<dyn ModelsManagerImpl> {
+        Arc::new(Self { inner })
+    }
+}
+
+impl ModelsManagerImpl for ModelsManagerAdapter {
     fn get_model(
         &self,
         model_id: &Option<String>,
     ) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
         let model_id = model_id.clone();
         Box::pin(async move {
-            self.get_default_model(&model_id, RefreshStrategy::OnlineIfUncached)
+            self.inner
+                .get_default_model(&model_id, RefreshStrategy::OnlineIfUncached)
                 .await
         })
     }
 
     fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
-        Box::pin(self.list_models(RefreshStrategy::OnlineIfUncached))
+        Box::pin(self.inner.list_models(RefreshStrategy::OnlineIfUncached))
     }
 }
 
 pub trait Auth {
-    fn logout(&self) -> Result<bool, Error>;
+    fn logout(&self) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>>;
 }
 
 impl Auth for Arc<AuthManager> {
-    fn logout(&self) -> Result<bool, Error> {
-        self.as_ref()
-            .logout()
-            .map_err(|e| Error::internal_error().data(e.to_string()))
+    fn logout(&self) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>> {
+        Box::pin(async move {
+            self.as_ref()
+                .logout()
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))
+        })
     }
 }
 
@@ -424,7 +468,7 @@ enum PendingPermissionRequest {
     },
     RequestPermissions {
         call_id: String,
-        permissions: PermissionProfile,
+        permissions: RequestPermissionProfile,
     },
     McpElicitation {
         server_name: String,
@@ -757,9 +801,8 @@ impl SubmissionState {
     }
 
     fn fail(&mut self, err: Error) {
-        if let Self::Prompt(state) = self
-            && let Some(response_tx) = state.response_tx.take()
-        {
+        let Self::Prompt(state) = self;
+        if let Some(response_tx) = state.response_tx.take() {
             drop(response_tx.send(Err(err)));
         }
     }
@@ -927,12 +970,12 @@ impl PromptState {
                         ..
                     }) => match option_id.0.as_ref() {
                         "approved-for-session" => RequestPermissionsResponse {
-                            permissions: permissions.into(),
+                            permissions: permissions.clone(),
                             scope: PermissionGrantScope::Session,
                             strict_auto_review: false,
                         },
                         "approved" => RequestPermissionsResponse {
-                            permissions: permissions.into(),
+                            permissions: permissions.clone(),
                             scope: PermissionGrantScope::Turn,
                             strict_auto_review: false,
                         },
@@ -1436,6 +1479,7 @@ impl PromptState {
             | EventMsg::ThreadRolledBack(..)
             | EventMsg::HookStarted(..)
             | EventMsg::HookCompleted(..)
+            | EventMsg::ThreadGoalUpdated(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
@@ -2248,7 +2292,7 @@ impl PromptState {
             permissions_request_key(&call_id),
             PendingPermissionRequest::RequestPermissions {
                 call_id,
-                permissions: permissions.into(),
+                permissions,
             },
             ToolCallUpdate::new(
                 tool_call_id,
@@ -2334,7 +2378,7 @@ struct ExecPermissionOption {
 fn build_exec_permission_options(
     available_decisions: &[ReviewDecision],
     network_approval_context: Option<&NetworkApprovalContext>,
-    additional_permissions: Option<&PermissionProfile>,
+    additional_permissions: Option<&AdditionalPermissionProfile>,
 ) -> Vec<ExecPermissionOption> {
     available_decisions
         .iter()
@@ -2680,6 +2724,8 @@ struct ThreadActor<A> {
     auth: A,
     /// Used for sending messages back to the client.
     client: SessionClient,
+    /// The Codex thread id derived from the ACP session id.
+    thread_id: Option<ThreadId>,
     /// The thread associated with this task.
     thread: Arc<dyn CodexThreadImpl>,
     /// The configuration for the thread.
@@ -2710,9 +2756,11 @@ impl<A: Auth> ThreadActor<A> {
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     ) -> Self {
+        let thread_id = ThreadId::from_string(client.session_id.0.as_ref()).ok();
         Self {
             auth,
             client,
+            thread_id,
             thread,
             config,
             models_manager,
@@ -2760,12 +2808,13 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 let client = self.client.clone();
+                let commands = self.builtin_commands();
                 // Have this happen after the session is loaded by putting it
                 // in a separate task
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     client.send_notification(SessionUpdate::AvailableCommandsUpdate(
-                        AvailableCommandsUpdate::new(Self::builtin_commands()),
+                        AvailableCommandsUpdate::new(commands),
                     ));
                 });
             }
@@ -2836,8 +2885,8 @@ impl<A: Auth> ThreadActor<A> {
         }
     }
 
-    fn builtin_commands() -> Vec<AvailableCommand> {
-        vec![
+    fn builtin_commands(&self) -> Vec<AvailableCommand> {
+        let mut commands = vec![
             AvailableCommand::new("review", "Review my current changes and find issues").input(
                 AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
                     "optional custom review instructions",
@@ -2867,7 +2916,18 @@ impl<A: Auth> ThreadActor<A> {
             ),
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
-        ]
+        ];
+
+        if self.config.features.enabled(Feature::Goals) {
+            commands.push(
+                AvailableCommand::new("goal", "set or view the goal for a long-running task")
+                    .input(AvailableCommandInput::Unstructured(
+                        UnstructuredCommandInput::new("objective | pause | resume | clear"),
+                    )),
+            );
+        }
+
+        commands
     }
 
     fn modes(&self) -> Option<SessionModeState> {
@@ -2876,8 +2936,7 @@ impl<A: Auth> ThreadActor<A> {
             .find(|preset| {
                 std::mem::discriminant(&preset.approval)
                     == std::mem::discriminant(self.config.permissions.approval_policy.get())
-                    && std::mem::discriminant(&preset.sandbox)
-                        == std::mem::discriminant(self.config.permissions.sandbox_policy.get())
+                    && preset.permission_profile == self.config.permissions.permission_profile()
             })
             .or_else(|| {
                 // When the project is untrusted, the above code won't match
@@ -3316,8 +3375,14 @@ impl<A: Auth> ThreadActor<A> {
                     }
                 }
                 "logout" => {
-                    self.auth.logout()?;
+                    self.auth.logout().await?;
                     return Err(Error::auth_required());
+                }
+                "goal" => {
+                    let message = self.handle_goal_command(rest).await?;
+                    self.client.send_agent_text(message);
+                    response_tx.send(Ok(StopReason::EndTurn)).ok();
+                    return Ok(response_rx);
                 }
                 _ => {
                     op = Op::UserInput {
@@ -3358,6 +3423,172 @@ impl<A: Auth> ThreadActor<A> {
         Ok(response_rx)
     }
 
+    async fn handle_goal_command(&mut self, args: &str) -> Result<String, Error> {
+        if !self.config.features.enabled(Feature::Goals) {
+            return Ok(
+                "Thread goals are disabled. Enable the Codex `goals` feature to use `/goal`."
+                    .to_string(),
+            );
+        }
+
+        let thread_id = self.thread_id.ok_or_else(|| {
+            Error::internal_error().data("ACP session id is not a valid Codex thread id")
+        })?;
+        let state_db = self.thread.state_db().ok_or_else(|| {
+            Error::internal_error().data("sqlite state db unavailable for thread goals")
+        })?;
+
+        let trimmed = args.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "" => self.describe_thread_goal(thread_id, &state_db).await,
+            "clear" => self.clear_thread_goal(thread_id, &state_db).await,
+            "pause" => {
+                self.set_thread_goal_status(
+                    thread_id,
+                    &state_db,
+                    codex_state::ThreadGoalStatus::Paused,
+                )
+                .await
+            }
+            "resume" => {
+                self.set_thread_goal_status(
+                    thread_id,
+                    &state_db,
+                    codex_state::ThreadGoalStatus::Active,
+                )
+                .await
+            }
+            _ => {
+                self.set_thread_goal_objective(thread_id, &state_db, trimmed)
+                    .await
+            }
+        }
+    }
+
+    async fn describe_thread_goal(
+        &self,
+        thread_id: ThreadId,
+        state_db: &StateDbHandle,
+    ) -> Result<String, Error> {
+        let goal = state_db
+            .get_thread_goal(thread_id)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        Ok(match goal {
+            Some(goal) => format_thread_goal_summary(&protocol_thread_goal_from_state(goal)),
+            None => "Usage: /goal <objective>\nNo goal is currently set.".to_string(),
+        })
+    }
+
+    async fn set_thread_goal_objective(
+        &mut self,
+        thread_id: ThreadId,
+        state_db: &StateDbHandle,
+        objective: &str,
+    ) -> Result<String, Error> {
+        validate_thread_goal_objective(objective)
+            .map_err(|message| Error::invalid_params().data(message))?;
+
+        let previous = state_db
+            .get_thread_goal(thread_id)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        let replacing = previous
+            .as_ref()
+            .is_some_and(|goal| goal.objective != objective || goal.status.is_terminal());
+
+        self.thread.prepare_external_goal_mutation().await;
+        let goal = if let Some(previous_goal) = previous.as_ref().filter(|goal| {
+            goal.objective == objective && goal.status != codex_state::ThreadGoalStatus::Complete
+        }) {
+            state_db
+                .update_thread_goal(
+                    thread_id,
+                    codex_state::ThreadGoalUpdate {
+                        status: Some(codex_state::ThreadGoalStatus::Active),
+                        token_budget: None,
+                        expected_goal_id: Some(previous_goal.goal_id.clone()),
+                    },
+                )
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?
+                .ok_or_else(|| Error::internal_error().data("thread goal disappeared"))?
+        } else {
+            state_db
+                .replace_thread_goal(
+                    thread_id,
+                    objective,
+                    codex_state::ThreadGoalStatus::Active,
+                    None,
+                )
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?
+        };
+
+        self.thread.apply_external_goal_set(goal.status).await;
+        let goal = protocol_thread_goal_from_state(goal);
+        let action = if replacing {
+            "Goal replaced"
+        } else {
+            "Goal set"
+        };
+        Ok(format!("{action}.\n{}", format_thread_goal_summary(&goal)))
+    }
+
+    async fn set_thread_goal_status(
+        &mut self,
+        thread_id: ThreadId,
+        state_db: &StateDbHandle,
+        status: codex_state::ThreadGoalStatus,
+    ) -> Result<String, Error> {
+        self.thread.prepare_external_goal_mutation().await;
+        let goal = state_db
+            .update_thread_goal(
+                thread_id,
+                codex_state::ThreadGoalUpdate {
+                    status: Some(status),
+                    token_budget: None,
+                    expected_goal_id: None,
+                },
+            )
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        let Some(goal) = goal else {
+            return Ok(
+                "No goal is currently set. Use `/goal <objective>` to create one.".to_string(),
+            );
+        };
+
+        self.thread.apply_external_goal_set(goal.status).await;
+        let goal = protocol_thread_goal_from_state(goal);
+        Ok(format!(
+            "Goal {}.\n{}",
+            thread_goal_status_label(goal.status),
+            format_thread_goal_summary(&goal)
+        ))
+    }
+
+    async fn clear_thread_goal(
+        &mut self,
+        thread_id: ThreadId,
+        state_db: &StateDbHandle,
+    ) -> Result<String, Error> {
+        self.thread.prepare_external_goal_mutation().await;
+        let cleared = state_db
+            .delete_thread_goal(thread_id)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        if cleared {
+            self.thread.apply_external_goal_clear().await;
+            Ok("Goal cleared.".to_string())
+        } else {
+            Ok("No goal to clear. This thread does not currently have a goal.".to_string())
+        }
+    }
+
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
         let preset = APPROVAL_PRESETS
             .iter()
@@ -3368,7 +3599,7 @@ impl<A: Auth> ThreadActor<A> {
             .submit(Op::OverrideTurnContext {
                 cwd: None,
                 approval_policy: Some(preset.approval),
-                sandbox_policy: Some(preset.sandbox.clone()),
+                sandbox_policy: None,
                 model: None,
                 effort: None,
                 summary: None,
@@ -3377,7 +3608,7 @@ impl<A: Auth> ThreadActor<A> {
                 windows_sandbox_level: None,
                 service_tier: None,
                 approvals_reviewer: None,
-                permission_profile: None,
+                permission_profile: Some(preset.permission_profile.clone()),
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3389,22 +3620,16 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         self.config
             .permissions
-            .sandbox_policy
-            .set(preset.sandbox.clone())
+            .set_permission_profile(preset.permission_profile.clone())
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        match preset.sandbox {
-            // Treat this user action as a trusted dir
-            SandboxPolicy::DangerFullAccess
-            | SandboxPolicy::WorkspaceWrite { .. }
-            | SandboxPolicy::ExternalSandbox { .. } => {
-                set_project_trust_level(
-                    &self.config.codex_home,
-                    &self.config.cwd,
-                    TrustLevel::Trusted,
-                )?;
-            }
-            SandboxPolicy::ReadOnly { .. } => {}
+        // Treat switching to a writable preset as a trust decision for the current project.
+        if preset.id != "read-only" {
+            set_project_trust_level(
+                &self.config.codex_home,
+                &self.config.cwd,
+                TrustLevel::Trusted,
+            )?;
         }
 
         Ok(())
@@ -4059,6 +4284,52 @@ fn guardian_command_source_label(source: &GuardianCommandSource) -> &'static str
     }
 }
 
+fn protocol_thread_goal_from_state(goal: codex_state::ThreadGoal) -> ThreadGoal {
+    ThreadGoal {
+        thread_id: goal.thread_id,
+        objective: goal.objective,
+        status: thread_goal_status_from_state(goal.status),
+        token_budget: goal.token_budget,
+        tokens_used: goal.tokens_used,
+        time_used_seconds: goal.time_used_seconds,
+        created_at: goal.created_at.timestamp(),
+        updated_at: goal.updated_at.timestamp(),
+    }
+}
+
+fn thread_goal_status_from_state(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
+    match status {
+        codex_state::ThreadGoalStatus::Active => ThreadGoalStatus::Active,
+        codex_state::ThreadGoalStatus::Paused => ThreadGoalStatus::Paused,
+        codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
+        codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
+    }
+}
+
+fn thread_goal_status_label(status: ThreadGoalStatus) -> &'static str {
+    match status {
+        ThreadGoalStatus::Active => "active",
+        ThreadGoalStatus::Paused => "paused",
+        ThreadGoalStatus::BudgetLimited => "budget-limited",
+        ThreadGoalStatus::Complete => "complete",
+    }
+}
+
+fn format_thread_goal_summary(goal: &ThreadGoal) -> String {
+    let usage = match goal.token_budget {
+        Some(token_budget) => format!("tokens used: {} of {token_budget}", goal.tokens_used),
+        None => format!("tokens used: {}", goal.tokens_used),
+    };
+
+    format!(
+        "Goal {}: {}\n{}\ntime used: {} seconds",
+        thread_goal_status_label(goal.status),
+        goal.objective,
+        usage,
+        goal.time_used_seconds
+    )
+}
+
 fn format_file_system_entries<'a>(
     entries: impl Iterator<Item = &'a FileSystemSandboxEntry>,
 ) -> String {
@@ -4080,7 +4351,6 @@ fn format_file_system_special(value: &FileSystemSpecialPath) -> String {
     match value {
         FileSystemSpecialPath::Root => ":root".to_string(),
         FileSystemSpecialPath::Minimal => ":minimal".to_string(),
-        FileSystemSpecialPath::CurrentWorkingDirectory => ":cwd".to_string(),
         FileSystemSpecialPath::ProjectRoots { subpath } => {
             format_file_system_subpath(":project_roots", subpath.as_deref())
         }
@@ -4234,6 +4504,144 @@ mod tests {
         ));
         let ops = thread.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_goal_command_sets_thread_goal_without_prompt() -> anyhow::Result<()> {
+        let thread_id = ThreadId::new();
+        let session_id = SessionId::new(thread_id.to_string());
+        let state_db = test_state_db(thread_id).await?;
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::with_state_db(state_db.clone()));
+        let models_manager = Arc::new(StubModelsManager);
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.features.enable(Feature::Goals)?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+        let _handle = tokio::spawn(actor.spawn());
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["/goal improve benchmark coverage".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+
+        let goal = state_db
+            .get_thread_goal(thread_id)
+            .await?
+            .expect("goal should be set");
+        assert_eq!(goal.objective, "improve benchmark coverage");
+        assert_eq!(goal.status, codex_state::ThreadGoalStatus::Active);
+        assert!(thread.ops.lock().unwrap().is_empty());
+        assert_eq!(
+            thread
+                .prepared_goal_mutations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            thread.applied_goal_sets.lock().unwrap().as_slice(),
+            &[codex_state::ThreadGoalStatus::Active]
+        );
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text.contains("Goal set.") && text.contains("improve benchmark coverage")
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_goal_command_pause_resume_and_clear() -> anyhow::Result<()> {
+        let thread_id = ThreadId::new();
+        let session_id = SessionId::new(thread_id.to_string());
+        let state_db = test_state_db(thread_id).await?;
+        state_db
+            .replace_thread_goal(
+                thread_id,
+                "ship the release",
+                codex_state::ThreadGoalStatus::Active,
+                None,
+            )
+            .await?;
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::with_state_db(state_db.clone()));
+        let models_manager = Arc::new(StubModelsManager);
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.features.enable(Feature::Goals)?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+        let _handle = tokio::spawn(actor.spawn());
+
+        for command in ["/goal pause", "/goal resume", "/goal clear"] {
+            let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+            message_tx.send(ThreadMessage::Prompt {
+                request: PromptRequest::new(session_id.clone(), vec![command.into()]),
+                response_tx: prompt_response_tx,
+            })?;
+            assert_eq!(prompt_response_rx.await??.await??, StopReason::EndTurn);
+        }
+
+        assert!(state_db.get_thread_goal(thread_id).await?.is_none());
+        assert_eq!(
+            thread.applied_goal_sets.lock().unwrap().as_slice(),
+            &[
+                codex_state::ThreadGoalStatus::Paused,
+                codex_state::ThreadGoalStatus::Active,
+            ]
+        );
+        assert_eq!(
+            thread
+                .applied_goal_clears
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
 
         Ok(())
     }
@@ -4593,11 +5001,26 @@ mod tests {
         Ok((session_id, client, conversation, message_tx, handle))
     }
 
+    async fn test_state_db(thread_id: ThreadId) -> anyhow::Result<StateDbHandle> {
+        let dir = std::env::temp_dir().join(format!("codex-acp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let state_db = codex_state::StateRuntime::init(dir.clone(), "openai".to_string()).await?;
+        let metadata = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            dir.join("rollout.jsonl"),
+            chrono::Utc::now(),
+            codex_protocol::protocol::SessionSource::Unknown,
+        )
+        .build("openai");
+        state_db.upsert_thread(&metadata).await?;
+        Ok(state_db)
+    }
+
     struct StubAuth;
 
     impl Auth for StubAuth {
-        fn logout(&self) -> Result<bool, Error> {
-            Ok(true)
+        fn logout(&self) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>> {
+            Box::pin(async { Ok(true) })
         }
     }
 
@@ -4622,6 +5045,10 @@ mod tests {
         ops: std::sync::Mutex<Vec<Op>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
+        state_db: Option<StateDbHandle>,
+        prepared_goal_mutations: AtomicUsize,
+        applied_goal_sets: std::sync::Mutex<Vec<codex_state::ThreadGoalStatus>>,
+        applied_goal_clears: AtomicUsize,
     }
 
     impl StubCodexThread {
@@ -4633,6 +5060,17 @@ mod tests {
                 ops: std::sync::Mutex::default(),
                 op_tx,
                 op_rx: Mutex::new(op_rx),
+                state_db: None,
+                prepared_goal_mutations: AtomicUsize::new(0),
+                applied_goal_sets: std::sync::Mutex::default(),
+                applied_goal_clears: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_state_db(state_db: StateDbHandle) -> Self {
+            Self {
+                state_db: Some(state_db),
+                ..Self::new()
             }
         }
     }
@@ -4943,6 +5381,33 @@ mod tests {
                     return Err(CodexErr::InternalAgentDied);
                 };
                 Ok(event)
+            })
+        }
+
+        fn state_db(&self) -> Option<StateDbHandle> {
+            self.state_db.clone()
+        }
+
+        fn prepare_external_goal_mutation(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async {
+                self.prepared_goal_mutations
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        }
+
+        fn apply_external_goal_set(
+            &self,
+            status: codex_state::ThreadGoalStatus,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.applied_goal_sets.lock().unwrap().push(status);
+            })
+        }
+
+        fn apply_external_goal_clear(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async {
+                self.applied_goal_clears
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
         }
     }
