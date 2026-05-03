@@ -28,7 +28,7 @@ use agent_client_protocol::{
 use codex_apply_patch::parse_patch;
 use codex_config::types::ServiceTier;
 use codex_core::{
-    CodexThread,
+    CodexThread, SteerInputError,
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
@@ -201,6 +201,12 @@ struct ThreadGoalClearedNotification {
 pub trait CodexThreadImpl: Send + Sync {
     fn submit(&self, op: Op)
     -> Pin<Box<dyn Future<Output = Result<String, CodexErr>> + Send + '_>>;
+    fn steer_input(
+        &self,
+        input: Vec<UserInput>,
+        expected_turn_id: Option<String>,
+        responsesapi_client_metadata: Option<HashMap<String, String>>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, SteerInputError>> + Send + '_>>;
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>>;
     fn state_db(&self) -> Option<StateDbHandle>;
     fn prepare_external_goal_mutation(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
@@ -221,6 +227,23 @@ impl CodexThreadImpl for CodexThread {
 
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>> {
         Box::pin(self.next_event())
+    }
+
+    fn steer_input(
+        &self,
+        input: Vec<UserInput>,
+        expected_turn_id: Option<String>,
+        responsesapi_client_metadata: Option<HashMap<String, String>>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, SteerInputError>> + Send + '_>> {
+        Box::pin(async move {
+            CodexThread::steer_input(
+                self,
+                input,
+                expected_turn_id.as_deref(),
+                responsesapi_client_metadata,
+            )
+            .await
+        })
     }
 
     fn state_db(&self) -> Option<StateDbHandle> {
@@ -844,11 +867,27 @@ impl SubmissionState {
         }
     }
 
+    fn attach_response_tx(
+        &mut self,
+        response_tx: oneshot::Sender<Result<StopReason, Error>>,
+    ) -> Result<(), oneshot::Sender<Result<StopReason, Error>>> {
+        match self {
+            Self::Prompt(state) => state.attach_response_tx(response_tx),
+        }
+    }
+
+    fn is_goal_background(&self) -> bool {
+        match self {
+            Self::Prompt(state) => state.goal_background,
+        }
+    }
+
     fn fail(&mut self, err: Error) {
         let Self::Prompt(state) = self;
         if let Some(response_tx) = state.response_tx.take() {
             drop(response_tx.send(Err(err)));
         }
+        state.completed = true;
     }
 }
 
@@ -869,6 +908,8 @@ struct PromptState {
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
+    goal_background: bool,
+    completed: bool,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
 }
@@ -890,16 +931,57 @@ impl PromptState {
             pending_permission_interactions: HashMap::new(),
             event_count: 0,
             response_tx: Some(response_tx),
+            goal_background: false,
+            completed: false,
+            seen_message_deltas: false,
+            seen_reasoning_deltas: false,
+        }
+    }
+
+    fn new_goal_background(
+        submission_id: String,
+        thread: Arc<dyn CodexThreadImpl>,
+        resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
+    ) -> Self {
+        Self {
+            submission_id,
+            active_commands: HashMap::new(),
+            active_web_search: None,
+            active_guardian_assessments: HashSet::new(),
+            thread,
+            resolution_tx,
+            pending_permission_interactions: HashMap::new(),
+            event_count: 0,
+            response_tx: None,
+            goal_background: true,
+            completed: false,
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
         }
     }
 
     fn is_active(&self) -> bool {
+        if self.completed {
+            return false;
+        }
+        if self.goal_background {
+            return true;
+        }
         let Some(response_tx) = &self.response_tx else {
             return false;
         };
         !response_tx.is_closed()
+    }
+
+    fn attach_response_tx(
+        &mut self,
+        response_tx: oneshot::Sender<Result<StopReason, Error>>,
+    ) -> Result<(), oneshot::Sender<Result<StopReason, Error>>> {
+        if self.completed || self.response_tx.is_some() {
+            return Err(response_tx);
+        }
+        self.response_tx = Some(response_tx);
+        Ok(())
     }
 
     fn abort_pending_interactions(&mut self) {
@@ -1385,6 +1467,7 @@ impl PromptState {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
+                self.completed = true;
             }
             EventMsg::UndoStarted(event) => {
                 client.send_agent_text(
@@ -1423,6 +1506,7 @@ impl PromptState {
                         )))
                         .ok();
                 }
+                self.completed = true;
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
@@ -1430,6 +1514,7 @@ impl PromptState {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
+                self.completed = true;
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
@@ -1437,6 +1522,7 @@ impl PromptState {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
+                self.completed = true;
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
                 info!("ViewImageToolCallEvent received");
@@ -3525,6 +3611,47 @@ impl<A: Auth> ThreadActor<A> {
             }
         }
 
+        if let Op::UserInput {
+            items,
+            responsesapi_client_metadata,
+            ..
+        } = &op
+            && let Some(active_goal_turn_id) = self.active_goal_background_submission_id()
+        {
+            match self
+                .thread
+                .steer_input(
+                    items.clone(),
+                    Some(active_goal_turn_id.clone()),
+                    responsesapi_client_metadata.clone(),
+                )
+                .await
+            {
+                Ok(turn_id) => {
+                    let Some(submission) = self.submissions.get_mut(&turn_id) else {
+                        return Err(Error::internal_error()
+                            .data("active goal turn disappeared after steering input"));
+                    };
+                    if let Err(response_tx) = submission.attach_response_tx(response_tx) {
+                        drop(
+                            response_tx.send(Err(Error::invalid_request()
+                                .data("active goal turn already has a pending prompt response"))),
+                        );
+                    }
+                    return Ok(response_rx);
+                }
+                Err(SteerInputError::NoActiveTurn(_))
+                | Err(SteerInputError::ExpectedTurnMismatch { .. }) => {
+                    // The background turn finished between checking ACP state and
+                    // steering; submit normally so Codex can start or steer the
+                    // currently active turn using its standard path.
+                }
+                Err(err) => {
+                    return Err(Error::invalid_request().data(format!("{err:?}")));
+                }
+            }
+        }
+
         let submission_id = self
             .thread
             .submit(op.clone())
@@ -3823,6 +3950,36 @@ impl<A: Auth> ThreadActor<A> {
     fn abort_pending_interactions(&mut self) {
         for submission in self.submissions.values_mut() {
             submission.abort_pending_interactions();
+        }
+    }
+
+    fn active_goal_background_submission_id(&self) -> Option<String> {
+        self.submissions.iter().find_map(|(id, submission)| {
+            if submission.is_goal_background() && submission.is_active() {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn has_active_thread_goal(&self) -> bool {
+        if !self.config.features.enabled(Feature::Goals) {
+            return false;
+        }
+        let Some(thread_id) = self.thread_id else {
+            return false;
+        };
+        let Some(state_db) = self.thread.state_db() else {
+            return false;
+        };
+        match state_db.get_thread_goal(thread_id).await {
+            Ok(Some(goal)) => goal.status == codex_state::ThreadGoalStatus::Active,
+            Ok(None) => false,
+            Err(err) => {
+                warn!("Failed to read thread goal while routing background event: {err}");
+                false
+            }
         }
     }
 
@@ -4140,7 +4297,33 @@ impl<A: Auth> ThreadActor<A> {
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
         } else {
-            warn!("Received event for unknown submission ID: {id} {msg:?}");
+            match msg {
+                EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                    thread_id,
+                    turn_id,
+                    goal,
+                }) => {
+                    self.client
+                        .send_thread_goal_updated(&thread_id, turn_id, &goal);
+                }
+                msg => {
+                    if self.has_active_thread_goal().await {
+                        info!(
+                            "Routing unknown event id {id} through goal background submission: {msg:?}"
+                        );
+                        let mut submission =
+                            SubmissionState::Prompt(PromptState::new_goal_background(
+                                id.clone(),
+                                self.thread.clone(),
+                                self.resolution_tx.clone(),
+                            ));
+                        submission.handle_event(&self.client, msg).await;
+                        self.submissions.insert(id, submission);
+                    } else {
+                        warn!("Received event for unknown submission ID: {id} {msg:?}");
+                    }
+                }
+            }
         }
     }
 }
@@ -4853,6 +5036,178 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_unknown_goal_turn_events_route_to_session() -> anyhow::Result<()> {
+        let thread_id = ThreadId::new();
+        let session_id = SessionId::new(thread_id.to_string());
+        let state_db = test_state_db(thread_id).await?;
+        state_db
+            .replace_thread_goal(
+                thread_id,
+                "ship the release",
+                codex_state::ThreadGoalStatus::Active,
+                None,
+            )
+            .await?;
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::with_state_db(state_db));
+        let models_manager = Arc::new(StubModelsManager);
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.features.enable(Feature::Goals)?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread,
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+        drop(message_tx);
+
+        actor
+            .handle_event(Event {
+                id: "goal-turn".to_string(),
+                msg: EventMsg::TurnStarted(TurnStartedEvent {
+                    model_context_window: None,
+                    collaboration_mode_kind: ModeKind::default(),
+                    turn_id: "goal-turn".to_string(),
+                    started_at: None,
+                }),
+            })
+            .await;
+        actor
+            .handle_event(Event {
+                id: "goal-turn".to_string(),
+                msg: EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "goal-turn".to_string(),
+                    item_id: "item-1".to_string(),
+                    delta: "continuing goal".to_string(),
+                }),
+            })
+            .await;
+        actor
+            .handle_event(Event {
+                id: "goal-turn".to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    last_agent_message: None,
+                    turn_id: "goal-turn".to_string(),
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                }),
+            })
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "continuing goal"
+            )
+        }));
+        assert!(
+            actor
+                .submissions
+                .get("goal-turn")
+                .is_some_and(|submission| !submission.is_active())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompt_during_goal_turn_steers_into_background_submission() -> anyhow::Result<()>
+    {
+        let thread_id = ThreadId::new();
+        let session_id = SessionId::new(thread_id.to_string());
+        let state_db = test_state_db(thread_id).await?;
+        state_db
+            .replace_thread_goal(
+                thread_id,
+                "ship the release",
+                codex_state::ThreadGoalStatus::Active,
+                None,
+            )
+            .await?;
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id.clone(), client, Arc::default());
+        let thread = Arc::new(StubCodexThread::with_state_db(state_db));
+        let models_manager = Arc::new(StubModelsManager);
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.features.enable(Feature::Goals)?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+        drop(message_tx);
+
+        actor
+            .handle_event(Event {
+                id: "goal-turn".to_string(),
+                msg: EventMsg::TurnStarted(TurnStartedEvent {
+                    model_context_window: None,
+                    collaboration_mode_kind: ModeKind::default(),
+                    turn_id: "goal-turn".to_string(),
+                    started_at: None,
+                }),
+            })
+            .await;
+
+        let prompt_response_rx = actor
+            .handle_prompt(PromptRequest::new(session_id, vec!["adjust course".into()]))
+            .await?;
+        assert_eq!(
+            thread.steered_inputs.lock().unwrap().as_slice(),
+            &[(
+                Some("goal-turn".to_string()),
+                vec!["adjust course".to_string()]
+            )]
+        );
+        assert!(thread.ops.lock().unwrap().is_empty());
+
+        actor
+            .handle_event(Event {
+                id: "goal-turn".to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    last_agent_message: None,
+                    turn_id: "goal-turn".to_string(),
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                }),
+            })
+            .await;
+
+        assert_eq!(prompt_response_rx.await??, StopReason::EndTurn);
+
+        Ok(())
+    }
+
     #[test]
     fn test_guardian_execve_summary_uses_argv_without_duplication() -> anyhow::Result<()> {
         let action = GuardianAssessmentAction::Execve {
@@ -5256,6 +5611,7 @@ mod tests {
         prepared_goal_mutations: AtomicUsize,
         applied_goal_sets: std::sync::Mutex<Vec<codex_state::ThreadGoalStatus>>,
         applied_goal_clears: AtomicUsize,
+        steered_inputs: std::sync::Mutex<Vec<(Option<String>, Vec<String>)>>,
     }
 
     impl StubCodexThread {
@@ -5271,6 +5627,7 @@ mod tests {
                 prepared_goal_mutations: AtomicUsize::new(0),
                 applied_goal_sets: std::sync::Mutex::default(),
                 applied_goal_clears: AtomicUsize::new(0),
+                steered_inputs: std::sync::Mutex::default(),
             }
         }
 
@@ -5588,6 +5945,31 @@ mod tests {
                     return Err(CodexErr::InternalAgentDied);
                 };
                 Ok(event)
+            })
+        }
+
+        fn steer_input(
+            &self,
+            input: Vec<UserInput>,
+            expected_turn_id: Option<String>,
+            _responsesapi_client_metadata: Option<HashMap<String, String>>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, SteerInputError>> + Send + '_>> {
+            Box::pin(async move {
+                let texts = input
+                    .iter()
+                    .filter_map(|item| match item {
+                        UserInput::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                self.steered_inputs
+                    .lock()
+                    .unwrap()
+                    .push((expected_turn_id.clone(), texts));
+                match expected_turn_id {
+                    Some(turn_id) => Ok(turn_id),
+                    None => Err(SteerInputError::NoActiveTurn(input)),
+                }
             })
         }
 
