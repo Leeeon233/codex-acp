@@ -3501,8 +3501,9 @@ impl<A: Auth> ThreadActor<A> {
                     return Err(Error::auth_required());
                 }
                 "goal" => {
-                    let message = self.handle_goal_command(rest).await?;
-                    self.client.send_agent_text(message);
+                    if let Some(message) = self.handle_goal_command(rest).await? {
+                        self.client.send_agent_text(message);
+                    }
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                     return Ok(response_rx);
                 }
@@ -3545,12 +3546,12 @@ impl<A: Auth> ThreadActor<A> {
         Ok(response_rx)
     }
 
-    async fn handle_goal_command(&mut self, args: &str) -> Result<String, Error> {
+    async fn handle_goal_command(&mut self, args: &str) -> Result<Option<String>, Error> {
         if !self.config.features.enabled(Feature::Goals) {
-            return Ok(
+            return Ok(Some(
                 "Thread goals are disabled. Enable the Codex `goals` feature to use `/goal`."
                     .to_string(),
-            );
+            ));
         }
 
         let thread_id = self.thread_id.ok_or_else(|| {
@@ -3562,7 +3563,10 @@ impl<A: Auth> ThreadActor<A> {
 
         let trimmed = args.trim();
         match trimmed.to_ascii_lowercase().as_str() {
-            "" => self.describe_thread_goal(thread_id, &state_db).await,
+            "" => self
+                .describe_thread_goal(thread_id, &state_db)
+                .await
+                .map(Some),
             "clear" => self.clear_thread_goal(thread_id, &state_db).await,
             "pause" => {
                 self.set_thread_goal_status(
@@ -3608,7 +3612,7 @@ impl<A: Auth> ThreadActor<A> {
         thread_id: ThreadId,
         state_db: &StateDbHandle,
         objective: &str,
-    ) -> Result<String, Error> {
+    ) -> Result<Option<String>, Error> {
         validate_thread_goal_objective(objective)
             .map_err(|message| Error::invalid_params().data(message))?;
 
@@ -3616,9 +3620,6 @@ impl<A: Auth> ThreadActor<A> {
             .get_thread_goal(thread_id)
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
-        let replacing = previous
-            .as_ref()
-            .is_some_and(|goal| goal.objective != objective || goal.status.is_terminal());
 
         self.thread.prepare_external_goal_mutation().await;
         let goal = if let Some(previous_goal) = previous.as_ref().filter(|goal| {
@@ -3652,12 +3653,7 @@ impl<A: Auth> ThreadActor<A> {
         let goal = protocol_thread_goal_from_state(goal);
         self.client
             .send_thread_goal_updated(&thread_id, None, &goal);
-        let action = if replacing {
-            "Goal replaced"
-        } else {
-            "Goal set"
-        };
-        Ok(format!("{action}.\n{}", format_thread_goal_summary(&goal)))
+        Ok(None)
     }
 
     async fn set_thread_goal_status(
@@ -3665,7 +3661,7 @@ impl<A: Auth> ThreadActor<A> {
         thread_id: ThreadId,
         state_db: &StateDbHandle,
         status: codex_state::ThreadGoalStatus,
-    ) -> Result<String, Error> {
+    ) -> Result<Option<String>, Error> {
         self.thread.prepare_external_goal_mutation().await;
         let goal = state_db
             .update_thread_goal(
@@ -3680,27 +3676,23 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         let Some(goal) = goal else {
-            return Ok(
+            return Ok(Some(
                 "No goal is currently set. Use `/goal <objective>` to create one.".to_string(),
-            );
+            ));
         };
 
         self.thread.apply_external_goal_set(goal.status).await;
         let goal = protocol_thread_goal_from_state(goal);
         self.client
             .send_thread_goal_updated(&thread_id, None, &goal);
-        Ok(format!(
-            "Goal {}.\n{}",
-            thread_goal_status_label(goal.status),
-            format_thread_goal_summary(&goal)
-        ))
+        Ok(None)
     }
 
     async fn clear_thread_goal(
         &mut self,
         thread_id: ThreadId,
         state_db: &StateDbHandle,
-    ) -> Result<String, Error> {
+    ) -> Result<Option<String>, Error> {
         self.thread.prepare_external_goal_mutation().await;
         let cleared = state_db
             .delete_thread_goal(thread_id)
@@ -3710,9 +3702,11 @@ impl<A: Auth> ThreadActor<A> {
         if cleared {
             self.thread.apply_external_goal_clear().await;
             self.client.send_thread_goal_cleared(&thread_id);
-            Ok("Goal cleared.".to_string())
+            Ok(None)
         } else {
-            Ok("No goal to clear. This thread does not currently have a goal.".to_string())
+            Ok(Some(
+                "No goal to clear. This thread does not currently have a goal.".to_string(),
+            ))
         }
     }
 
@@ -4696,14 +4690,8 @@ mod tests {
         );
 
         let notifications = client.notifications.lock().unwrap();
-        assert_eq!(notifications.len(), 1);
-        assert!(matches!(
-            &notifications[0].update,
-            SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent { text, .. }),
-                ..
-            }) if text.contains("Goal set.") && text.contains("improve benchmark coverage")
-        ));
+        assert!(notifications.is_empty());
+        drop(notifications);
 
         let ext_notifications = client.ext_notifications.lock().unwrap();
         assert_eq!(ext_notifications.len(), 1);
@@ -4783,6 +4771,10 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.is_empty());
+        drop(notifications);
 
         let ext_notifications = client.ext_notifications.lock().unwrap();
         assert_eq!(ext_notifications.len(), 3);
