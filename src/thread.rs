@@ -18,11 +18,11 @@ use agent_client_protocol::{
         RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
         ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
         SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionConfigValueId, SessionId, SessionMode, SessionModeId,
-        SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
-        Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
-        ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-        UnstructuredCommandInput, UsageUpdate,
+        SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
+        SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
+        TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
+        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+        UsageUpdate,
     },
 };
 use codex_apply_patch::parse_patch;
@@ -3875,9 +3875,11 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         self.thread.prepare_external_goal_mutation().await;
-        let (goal, previous_status) = if let Some(previous_goal) = previous.as_ref().filter(|goal| {
-            goal.objective == objective && goal.status != codex_state::ThreadGoalStatus::Complete
-        }) {
+        let (goal, previous_status) = if let Some(previous_goal) =
+            previous.as_ref().filter(|goal| {
+                goal.objective == objective
+                    && goal.status != codex_state::ThreadGoalStatus::Complete
+            }) {
             let previous_status = ExternalGoalPreviousStatus::Existing(previous_goal.status);
             let goal = state_db
                 .update_thread_goal(
