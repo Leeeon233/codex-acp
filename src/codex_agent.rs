@@ -25,8 +25,10 @@ use codex_login::{
 };
 use codex_protocol::{
     ThreadId,
-    protocol::{InitialHistory, SessionSource},
+    protocol::{InitialHistory, SessionSource, ThreadGoalStatus},
 };
+use serde::Deserialize;
+use serde_json::value::{RawValue, to_raw_value};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -35,7 +37,7 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::thread::Thread;
+use crate::thread::{Thread, ThreadGoalPayload};
 
 /// The Codex implementation of the ACP Agent.
 ///
@@ -60,6 +62,85 @@ pub struct CodexAgent {
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
+const THREAD_GOAL_GET_METHOD: &str = "thread/goal/get";
+const THREAD_GOAL_SET_METHOD: &str = "thread/goal/set";
+const THREAD_GOAL_CLEAR_METHOD: &str = "thread/goal/clear";
+
+#[derive(Debug, Clone)]
+struct ThreadGoalExtRequest {
+    method: Arc<str>,
+    params: Arc<RawValue>,
+}
+
+impl acp::JsonRpcMessage for ThreadGoalExtRequest {
+    fn matches_method(method: &str) -> bool {
+        resolve_thread_goal_ext_method(method).is_some()
+    }
+
+    fn method(&self) -> &str {
+        &self.method
+    }
+
+    fn to_untyped_message(&self) -> Result<acp::UntypedMessage, Error> {
+        acp::UntypedMessage::new(&format!("_{}", self.method), &self.params)
+    }
+
+    fn parse_message(method: &str, params: &impl serde::Serialize) -> Result<Self, Error> {
+        let method = resolve_thread_goal_ext_method(method).ok_or_else(Error::method_not_found)?;
+        let params = to_raw_value(params).map_err(Error::into_internal_error)?;
+
+        Ok(Self {
+            method: Arc::from(method),
+            params: Arc::from(params),
+        })
+    }
+}
+
+impl acp::JsonRpcRequest for ThreadGoalExtRequest {
+    type Response = serde_json::Value;
+}
+
+fn resolve_thread_goal_ext_method(method: &str) -> Option<&str> {
+    let method = method.strip_prefix('_').unwrap_or(method);
+    match method {
+        THREAD_GOAL_GET_METHOD | THREAD_GOAL_SET_METHOD | THREAD_GOAL_CLEAR_METHOD => Some(method),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadGoalExtParams {
+    thread_id: String,
+    status: Option<ThreadGoalControlStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ThreadGoalControlStatus {
+    Active,
+    Paused,
+}
+
+impl From<ThreadGoalControlStatus> for ThreadGoalStatus {
+    fn from(status: ThreadGoalControlStatus) -> Self {
+        match status {
+            ThreadGoalControlStatus::Active => ThreadGoalStatus::Active,
+            ThreadGoalControlStatus::Paused => ThreadGoalStatus::Paused,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadGoalGetResponse {
+    thread_id: String,
+    goal: Option<ThreadGoalPayload>,
+}
+
+fn json_ext_response<T: serde::Serialize>(params: &T) -> Result<serde_json::Value, Error> {
+    serde_json::to_value(params).map_err(Error::into_internal_error)
+}
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
@@ -289,6 +370,22 @@ impl CodexAgent {
                 },
                 acp::on_receive_request!(),
             )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: ThreadGoalExtRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            responder
+                                .respond_with_result(agent.handle_thread_goal_ext(request).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
             .connect_to(transport)
             .await
     }
@@ -305,6 +402,39 @@ impl CodexAgent {
             .get(session_id)
             .ok_or_else(|| Error::resource_not_found(None))?
             .clone())
+    }
+
+    async fn handle_thread_goal_ext(
+        &self,
+        request: ThreadGoalExtRequest,
+    ) -> Result<serde_json::Value, Error> {
+        let params: ThreadGoalExtParams =
+            serde_json::from_str(request.params.get()).map_err(|e| {
+                Error::invalid_params().data(format!("invalid thread goal params: {e}"))
+            })?;
+        let thread = self.get_thread(&SessionId::new(params.thread_id.clone()))?;
+
+        match request.method.as_ref() {
+            THREAD_GOAL_GET_METHOD => {
+                let goal = thread.get_thread_goal().await?;
+                json_ext_response(&ThreadGoalGetResponse {
+                    thread_id: params.thread_id,
+                    goal: goal.as_ref().map(ThreadGoalPayload::from),
+                })
+            }
+            THREAD_GOAL_SET_METHOD => {
+                let status = params
+                    .status
+                    .ok_or_else(|| Error::invalid_params().data("missing thread goal status"))?;
+                thread.set_thread_goal_status(status.into()).await?;
+                json_ext_response(&serde_json::json!({}))
+            }
+            THREAD_GOAL_CLEAR_METHOD => {
+                thread.clear_thread_goal().await?;
+                json_ext_response(&serde_json::json!({}))
+            }
+            _ => Err(Error::method_not_found()),
+        }
     }
 
     async fn check_auth(&self) -> Result<(), Error> {
