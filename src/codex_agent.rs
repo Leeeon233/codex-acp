@@ -14,8 +14,9 @@ use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
 use codex_config::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    NewThread, RolloutRecorder, SortDirection, ThreadManager, ThreadSortKey, config::Config,
-    find_thread_path_by_id_str, parse_cursor,
+    NewThread, RolloutRecorder, SortDirection, StateDbHandle, ThreadManager, ThreadSortKey,
+    config::Config, find_thread_path_by_id_str, init_state_db, parse_cursor,
+    resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, EnvironmentManagerArgs, ExecServerRuntimePaths};
 use codex_login::{
@@ -24,10 +25,10 @@ use codex_login::{
 };
 use codex_protocol::{
     ThreadId,
-    protocol::{InitialHistory, SessionSource},
+    protocol::{InitialHistory, SessionSource, ThreadGoalStatus},
 };
-use codex_rollout::RolloutConfig;
-use codex_thread_store::{LocalThreadStore, ThreadStore};
+use serde::Deserialize;
+use serde_json::value::{RawValue, to_raw_value};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -36,7 +37,7 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::thread::Thread;
+use crate::thread::{Thread, ThreadGoalPayload};
 
 /// The Codex implementation of the ACP Agent.
 ///
@@ -51,6 +52,8 @@ pub struct CodexAgent {
     config: Config,
     /// Thread manager for handling sessions
     thread_manager: ThreadManager,
+    /// SQLite-backed Codex state index, when initialization succeeds
+    state_db: Option<StateDbHandle>,
     /// Active sessions mapped by `SessionId`
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Thread>>>>,
     /// Session working directories for filesystem sandboxing
@@ -59,6 +62,85 @@ pub struct CodexAgent {
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
+const THREAD_GOAL_GET_METHOD: &str = "thread/goal/get";
+const THREAD_GOAL_SET_METHOD: &str = "thread/goal/set";
+const THREAD_GOAL_CLEAR_METHOD: &str = "thread/goal/clear";
+
+#[derive(Debug, Clone)]
+struct ThreadGoalExtRequest {
+    method: Arc<str>,
+    params: Arc<RawValue>,
+}
+
+impl acp::JsonRpcMessage for ThreadGoalExtRequest {
+    fn matches_method(method: &str) -> bool {
+        resolve_thread_goal_ext_method(method).is_some()
+    }
+
+    fn method(&self) -> &str {
+        &self.method
+    }
+
+    fn to_untyped_message(&self) -> Result<acp::UntypedMessage, Error> {
+        acp::UntypedMessage::new(&format!("_{}", self.method), &self.params)
+    }
+
+    fn parse_message(method: &str, params: &impl serde::Serialize) -> Result<Self, Error> {
+        let method = resolve_thread_goal_ext_method(method).ok_or_else(Error::method_not_found)?;
+        let params = to_raw_value(params).map_err(Error::into_internal_error)?;
+
+        Ok(Self {
+            method: Arc::from(method),
+            params: Arc::from(params),
+        })
+    }
+}
+
+impl acp::JsonRpcRequest for ThreadGoalExtRequest {
+    type Response = serde_json::Value;
+}
+
+fn resolve_thread_goal_ext_method(method: &str) -> Option<&str> {
+    let method = method.strip_prefix('_').unwrap_or(method);
+    match method {
+        THREAD_GOAL_GET_METHOD | THREAD_GOAL_SET_METHOD | THREAD_GOAL_CLEAR_METHOD => Some(method),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadGoalExtParams {
+    thread_id: String,
+    status: Option<ThreadGoalControlStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ThreadGoalControlStatus {
+    Active,
+    Paused,
+}
+
+impl From<ThreadGoalControlStatus> for ThreadGoalStatus {
+    fn from(status: ThreadGoalControlStatus) -> Self {
+        match status {
+            ThreadGoalControlStatus::Active => ThreadGoalStatus::Active,
+            ThreadGoalControlStatus::Paused => ThreadGoalStatus::Paused,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadGoalGetResponse {
+    thread_id: String,
+    goal: Option<ThreadGoalPayload>,
+}
+
+fn json_ext_response<T: serde::Serialize>(params: &T) -> Result<serde_json::Value, Error> {
+    serde_json::to_value(params).map_err(Error::into_internal_error)
+}
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
@@ -76,6 +158,7 @@ impl CodexAgent {
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
+        let state_db = init_state_db(&config).await;
         let environment_manager = Arc::new(
             EnvironmentManager::new(EnvironmentManagerArgs::new(ExecServerRuntimePaths::new(
                 std::env::current_exe()?,
@@ -83,25 +166,27 @@ impl CodexAgent {
             )?))
             .await,
         );
+        let thread_store = thread_store_from_config(&config, state_db.clone());
+        let installation_id = resolve_installation_id(&config.codex_home).await?;
         let thread_manager = ThreadManager::new(
             &config,
             auth_manager.clone(),
             SessionSource::Unknown,
             environment_manager,
             None,
+            thread_store,
+            state_db.clone(),
+            installation_id,
         );
         Ok(Self {
             auth_manager,
             client_capabilities,
             config,
             thread_manager,
+            state_db,
             sessions: Arc::default(),
             session_roots,
         })
-    }
-
-    fn thread_store(config: &Config) -> Arc<dyn ThreadStore> {
-        Arc::new(LocalThreadStore::new(RolloutConfig::from_view(config)))
     }
 
     /// Build and run the ACP agent, serving requests over the given transport.
@@ -285,6 +370,22 @@ impl CodexAgent {
                 },
                 acp::on_receive_request!(),
             )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: ThreadGoalExtRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            responder
+                                .respond_with_result(agent.handle_thread_goal_ext(request).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
             .connect_to(transport)
             .await
     }
@@ -303,8 +404,45 @@ impl CodexAgent {
             .clone())
     }
 
+    async fn handle_thread_goal_ext(
+        &self,
+        request: ThreadGoalExtRequest,
+    ) -> Result<serde_json::Value, Error> {
+        let params: ThreadGoalExtParams =
+            serde_json::from_str(request.params.get()).map_err(|e| {
+                Error::invalid_params().data(format!("invalid thread goal params: {e}"))
+            })?;
+        let thread = self.get_thread(&SessionId::new(params.thread_id.clone()))?;
+
+        match request.method.as_ref() {
+            THREAD_GOAL_GET_METHOD => {
+                let goal = thread.get_thread_goal().await?;
+                json_ext_response(&ThreadGoalGetResponse {
+                    thread_id: params.thread_id,
+                    goal: goal.as_ref().map(ThreadGoalPayload::from),
+                })
+            }
+            THREAD_GOAL_SET_METHOD => {
+                let status = params
+                    .status
+                    .ok_or_else(|| Error::invalid_params().data("missing thread goal status"))?;
+                thread.set_thread_goal_status(status.into()).await?;
+                json_ext_response(&serde_json::json!({}))
+            }
+            THREAD_GOAL_CLEAR_METHOD => {
+                thread.clear_thread_goal().await?;
+                json_ext_response(&serde_json::json!({}))
+            }
+            _ => Err(Error::method_not_found()),
+        }
+    }
+
     async fn check_auth(&self) -> Result<(), Error> {
-        if self.config.model_provider_id == "openai" && self.auth_manager.auth().await.is_none() {
+        if self.config.model_provider_id == "openai"
+            && self.auth_manager.auth().await.is_none()
+            // Check if anything changed on disk since the last reload
+            && !self.auth_manager.reload().await
+        {
             return Err(Error::auth_required());
         }
         Ok(())
@@ -493,8 +631,6 @@ impl CodexAgent {
                     .block_until_done()
                     .await
                     .map_err(Error::into_internal_error)?;
-
-                self.auth_manager.reload().await;
             }
             CodexAuthMethod::CodexApiKey => {
                 let api_key = read_codex_api_key_from_env().ok_or_else(|| {
@@ -553,12 +689,9 @@ impl CodexAgent {
             thread_id,
             thread,
             session_configured: _,
-        } = Box::pin(
-            self.thread_manager
-                .start_thread(config.clone(), Self::thread_store(&config)),
-        )
-        .await
-        .map_err(|_e| Error::internal_error())?;
+        } = Box::pin(self.thread_manager.start_thread(config.clone()))
+            .await
+            .map_err(|_e| Error::internal_error())?;
 
         let session_id = Self::session_id_from_thread_id(thread_id);
         // Record the session root for filesystem sandboxing.
@@ -570,7 +703,7 @@ impl CodexAgent {
             session_id.clone(),
             thread,
             self.auth_manager.clone(),
-            crate::thread::ModelsManagerAdapter::new(self.thread_manager.get_models_manager()),
+            Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
             cx,
@@ -606,11 +739,14 @@ impl CodexAgent {
             ..
         } = request;
 
-        let rollout_path =
-            find_thread_path_by_id_str(&self.config.codex_home, session_id.0.as_ref())
-                .await
-                .map_err(|e| Error::internal_error().data(e.to_string()))?
-                .ok_or_else(|| Error::resource_not_found(None))?;
+        let rollout_path = find_thread_path_by_id_str(
+            &self.config.codex_home,
+            session_id.0.as_ref(),
+            self.state_db.as_deref(),
+        )
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))?
+        .ok_or_else(|| Error::resource_not_found(None))?;
 
         let history = RolloutRecorder::get_rollout_history(&rollout_path)
             .await
@@ -630,7 +766,6 @@ impl CodexAgent {
             session_configured: _,
         } = Box::pin(self.thread_manager.resume_thread_from_rollout(
             config.clone(),
-            Self::thread_store(&config),
             rollout_path,
             self.auth_manager.clone(),
             None,
@@ -642,7 +777,7 @@ impl CodexAgent {
             session_id.clone(),
             thread,
             self.auth_manager.clone(),
-            crate::thread::ModelsManagerAdapter::new(self.thread_manager.get_models_manager()),
+            Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
             cx,
@@ -674,6 +809,7 @@ impl CodexAgent {
         let cursor_obj = cursor.as_deref().and_then(parse_cursor);
 
         let page = RolloutRecorder::list_threads(
+            self.state_db.clone(),
             &self.config,
             SESSION_LIST_PAGE_SIZE,
             cursor_obj.as_ref(),

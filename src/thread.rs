@@ -12,23 +12,23 @@ use agent_client_protocol::{
     schema::{
         AgentNotification, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
         ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff,
-        EmbeddedResource, EmbeddedResourceResource, ExtNotification, LoadSessionResponse, Meta,
-        ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
-        PlanEntryPriority, PlanEntryStatus, PromptRequest, RawValue, RequestPermissionOutcome,
-        RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
-        SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+        EmbeddedResource, EmbeddedResourceResource, ExtNotification, ImageContent,
+        LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind,
+        Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RawValue,
+        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+        ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
         SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
-        SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
-        Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
-        ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-        UnstructuredCommandInput, UsageUpdate,
+        SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
+        SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
+        TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
+        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+        UsageUpdate,
     },
 };
 use codex_apply_patch::parse_patch;
 use codex_config::types::ServiceTier;
 use codex_core::{
-    CodexThread, SteerInputError,
+    CodexThread, ExternalGoalPreviousStatus, ExternalGoalSet, SteerInputError,
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
@@ -46,7 +46,10 @@ use codex_protocol::{
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     mcp::CallToolResult,
-    models::{AdditionalPermissionProfile, ResponseItem, WebSearchAction},
+    models::{
+        ActivePermissionProfile, AdditionalPermissionProfile, PermissionProfile, ResponseItem,
+        WebSearchAction,
+    },
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     permissions::{
@@ -59,16 +62,17 @@ use codex_protocol::{
         ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent,
-        ItemStartedEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent,
-        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
-        NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
-        PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
-        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem,
-        StreamErrorEvent, TerminalInteractionEvent, ThreadGoal, ThreadGoalStatus,
-        ThreadGoalUpdatedEvent, TokenCountEvent, TokenUsageInfo, TurnAbortedEvent,
-        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
-        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent, validate_thread_goal_objective,
+        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ImageGenerationBeginEvent,
+        ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
+        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
+        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
+        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
+        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
+        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
+        TerminalInteractionEvent, ThreadGoal, ThreadGoalStatus, ThreadGoalUpdatedEvent,
+        TokenCountEvent, TokenUsageInfo, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
+        UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
+        WebSearchEndEvent, validate_thread_goal_objective,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -125,8 +129,102 @@ const USAGE_METHOD: &str = "acp_ext:session_usage_update";
 const RATE_LIMITS_METHOD: &str = "acp_ext:session_rate_limits";
 const THREAD_GOAL_UPDATED_METHOD: &str = "acp_ext:thread_goal_updated";
 const THREAD_GOAL_CLEARED_METHOD: &str = "acp_ext:thread_goal_cleared";
-const IMAGE_GENERATION_BEGIN_METHOD: &str = "acp_ext:image_generation_begin";
-const IMAGE_GENERATION_END_METHOD: &str = "acp_ext:image_generation_end";
+
+const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
+const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
+const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
+
+fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
+    match profile_id {
+        CODEX_READ_ONLY_PROFILE_ID => Some("read-only"),
+        CODEX_WORKSPACE_PROFILE_ID => Some("auto"),
+        CODEX_DANGER_NO_SANDBOX_PROFILE_ID => Some("full-access"),
+        _ => None,
+    }
+}
+
+fn active_profile_id_for_session_mode(mode_id: &str) -> Option<&'static str> {
+    match mode_id {
+        "read-only" => Some(CODEX_READ_ONLY_PROFILE_ID),
+        "auto" => Some(CODEX_WORKSPACE_PROFILE_ID),
+        "full-access" => Some(CODEX_DANGER_NO_SANDBOX_PROFILE_ID),
+        _ => None,
+    }
+}
+
+fn approval_matches_current_config(preset: &ApprovalPreset, config: &Config) -> bool {
+    std::mem::discriminant(&preset.approval)
+        == std::mem::discriminant(config.permissions.approval_policy.get())
+}
+
+fn mode_id_if_approval_matches(mode_id: &'static str, config: &Config) -> Option<SessionModeId> {
+    APPROVAL_PRESETS
+        .iter()
+        .find(|preset| preset.id == mode_id && approval_matches_current_config(preset, config))
+        .map(|preset| SessionModeId::new(preset.id))
+}
+
+fn untrusted_read_only_mode_id(config: &Config) -> Option<SessionModeId> {
+    // When the project is untrusted, the approval policy won't match since
+    // AskForApproval::UnlessTrusted is not part of the default presets.
+    // However, we still want to show the mode selector, which allows the user
+    // to choose a different mode and trust the project.
+    config
+        .active_project
+        .is_untrusted()
+        .then(|| SessionModeId::new("read-only"))
+}
+
+fn semantic_session_mode_id_for_permission_profile(config: &Config) -> Option<&'static str> {
+    let permission_profile = config.permissions.permission_profile.get();
+
+    match permission_profile {
+        PermissionProfile::Managed { .. } => {
+            let workspace_preset = APPROVAL_PRESETS.iter().find(|preset| preset.id == "auto")?;
+            if permission_profile.network_sandbox_policy()
+                != workspace_preset.permission_profile.network_sandbox_policy()
+            {
+                return None;
+            }
+
+            let file_system = permission_profile.file_system_sandbox_policy();
+            let cwd = config.cwd.as_path();
+            if file_system.has_full_disk_read_access()
+                && !file_system.has_full_disk_write_access()
+                && file_system.can_write_path_with_cwd(cwd, cwd)
+            {
+                Some("auto")
+            } else {
+                None
+            }
+        }
+        PermissionProfile::Disabled => Some("full-access"),
+        PermissionProfile::External { .. } => None,
+    }
+}
+
+fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
+    if let Some(active_profile) = config.permissions.active_permission_profile().as_ref() {
+        return session_mode_id_for_active_profile(&active_profile.id)
+            .and_then(|mode_id| mode_id_if_approval_matches(mode_id, config))
+            .or_else(|| untrusted_read_only_mode_id(config));
+    }
+
+    if let Some(preset) = APPROVAL_PRESETS.iter().find(|preset| {
+        approval_matches_current_config(preset, config)
+            && &preset.permission_profile == config.permissions.permission_profile.get()
+    }) {
+        return Some(SessionModeId::new(preset.id));
+    }
+
+    semantic_session_mode_id_for_permission_profile(config)
+        .and_then(|mode_id| mode_id_if_approval_matches(mode_id, config))
+        .or_else(|| untrusted_read_only_mode_id(config))
+}
+
+fn mode_trusts_project(mode_id: &str) -> bool {
+    matches!(mode_id, "auto" | "full-access")
+}
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,24 +257,7 @@ pub struct RaceLimitUpdate {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ImageGenerationBeginPayload {
-    session_id: String,
-    call_id: String,
-}
-
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ImageGenerationEndPayload {
-    session_id: String,
-    call_id: String,
-    status: String,
-    revised_prompt: Option<String>,
-    saved_path: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ThreadGoalPayload {
+pub(crate) struct ThreadGoalPayload {
     thread_id: String,
     objective: String,
     status: ThreadGoalStatus,
@@ -231,7 +312,7 @@ pub trait CodexThreadImpl: Send + Sync {
     fn prepare_external_goal_mutation(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     fn apply_external_goal_set(
         &self,
-        status: codex_state::ThreadGoalStatus,
+        external_set: ExternalGoalSet,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     fn apply_external_goal_clear(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
@@ -275,9 +356,9 @@ impl CodexThreadImpl for CodexThread {
 
     fn apply_external_goal_set(
         &self,
-        status: codex_state::ThreadGoalStatus,
+        external_set: ExternalGoalSet,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(self.apply_external_goal_set(status))
+        Box::pin(self.apply_external_goal_set(external_set))
     }
 
     fn apply_external_goal_clear(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
@@ -293,46 +374,35 @@ pub trait ModelsManagerImpl: Send + Sync {
     fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>>;
 }
 
-pub struct ModelsManagerAdapter {
-    inner: Arc<dyn ModelsManager>,
-}
-
-impl ModelsManagerAdapter {
-    pub fn new(inner: Arc<dyn ModelsManager>) -> Arc<dyn ModelsManagerImpl> {
-        Arc::new(Self { inner })
-    }
-}
-
-impl ModelsManagerImpl for ModelsManagerAdapter {
+impl ModelsManagerImpl for Arc<dyn ModelsManager> {
     fn get_model(
         &self,
         model_id: &Option<String>,
     ) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
         let model_id = model_id.clone();
         Box::pin(async move {
-            self.inner
-                .get_default_model(&model_id, RefreshStrategy::OnlineIfUncached)
+            self.get_default_model(&model_id, RefreshStrategy::OnlineIfUncached)
                 .await
         })
     }
 
     fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
-        Box::pin(self.inner.list_models(RefreshStrategy::OnlineIfUncached))
+        Box::pin(async move {
+            ModelsManager::list_models(self.as_ref(), RefreshStrategy::OnlineIfUncached).await
+        })
     }
 }
 
 pub trait Auth {
-    fn logout(&self) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>>;
+    fn logout(&self) -> impl Future<Output = Result<bool, Error>> + Send;
 }
 
 impl Auth for Arc<AuthManager> {
-    fn logout(&self) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>> {
-        Box::pin(async move {
-            self.as_ref()
-                .logout()
-                .await
-                .map_err(|e| Error::internal_error().data(e.to_string()))
-        })
+    async fn logout(&self) -> Result<bool, Error> {
+        self.as_ref()
+            .logout()
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))
     }
 }
 
@@ -358,6 +428,16 @@ enum ThreadMessage {
     SetConfigOption {
         config_id: SessionConfigId,
         value: SessionConfigOptionValue,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    GetThreadGoal {
+        response_tx: oneshot::Sender<Result<Option<ThreadGoal>, Error>>,
+    },
+    SetThreadGoalStatus {
+        status: ThreadGoalStatus,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    ClearThreadGoal {
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
     Cancel {
@@ -490,6 +570,42 @@ impl Thread {
             value,
             response_tx,
         };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn get_thread_goal(&self) -> Result<Option<ThreadGoal>, Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::GetThreadGoal { response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn set_thread_goal_status(&self, status: ThreadGoalStatus) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::SetThreadGoalStatus {
+            status,
+            response_tx,
+        };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn clear_thread_goal(&self) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::ClearThreadGoal { response_tx };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -845,8 +961,24 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     }
 }
 
+fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
+    let status = match event.goal.status {
+        ThreadGoalStatus::Active => "active",
+        ThreadGoalStatus::Paused => "paused",
+        ThreadGoalStatus::BudgetLimited => "budget limited",
+        ThreadGoalStatus::Complete => "complete",
+    };
+
+    let objective = event.goal.objective.trim();
+    if objective.contains('\n') {
+        format!("Goal updated ({status}):\n{objective}")
+    } else {
+        format!("Goal updated ({status}): {objective}")
+    }
+}
+
 enum SubmissionState {
-    /// User prompts, including slash commands like /init, /review, /compact, /undo.
+    /// User prompts, including slash commands like /init, /review, /compact.
     Prompt(PromptState),
 }
 
@@ -921,6 +1053,7 @@ struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
     active_web_search: Option<String>,
+    active_image_generations: HashSet<String>,
     active_guardian_assessments: HashSet<String>,
     thread: Arc<dyn CodexThreadImpl>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
@@ -944,6 +1077,7 @@ impl PromptState {
             submission_id,
             active_commands: HashMap::new(),
             active_web_search: None,
+            active_image_generations: HashSet::new(),
             active_guardian_assessments: HashSet::new(),
             thread,
             resolution_tx,
@@ -966,6 +1100,7 @@ impl PromptState {
             submission_id,
             active_commands: HashMap::new(),
             active_web_search: None,
+            active_image_generations: HashSet::new(),
             active_guardian_assessments: HashSet::new(),
             thread,
             resolution_tx,
@@ -1188,6 +1323,8 @@ impl PromptState {
             | EventMsg::WebSearchBegin(..)
             | EventMsg::UserMessage(..)
             | EventMsg::ExecApprovalRequest(..)
+            | EventMsg::ImageGenerationBegin(..)
+            | EventMsg::ImageGenerationEnd(..)
             | EventMsg::ExecCommandBegin(..)
             | EventMsg::ExecCommandOutputDelta(..)
             | EventMsg::ExecCommandEnd(..)
@@ -1275,7 +1412,7 @@ impl PromptState {
                     client.send_ext_notification(RATE_LIMITS_METHOD, Arc::from(raw_value));
                 }
             }
-            EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
+            EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item , started_at_ms: _}) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
             }
             EventMsg::UserMessage(UserMessageEvent {
@@ -1337,13 +1474,18 @@ impl PromptState {
                     client.send_agent_thought(text);
                 }
             }
-            EventMsg::ThreadNameUpdated(event) => {
-                info!("Thread name updated: {:?}", event.thread_name);
-                if let Some(title) = event.thread_name {
-                    client.send_notification(SessionUpdate::SessionInfoUpdate(
-                        SessionInfoUpdate::new().title(title),
-                    ));
-                }
+            EventMsg::ThreadGoalUpdated(event) => {
+                info!(
+                    "Thread goal updated: thread_id={}, turn_id={:?}, status={:?}",
+                    event.thread_id, event.turn_id, event.goal.status
+                );
+                client.send_agent_text(format_thread_goal_update(&event));
+                let ThreadGoalUpdatedEvent {
+                    thread_id,
+                    turn_id,
+                    goal,
+                } = event;
+                client.send_thread_goal_updated(&thread_id, turn_id, &goal);
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
@@ -1366,6 +1508,17 @@ impl PromptState {
                 self.update_web_search_query(client, call_id, query, action);
                 // The actual search results will come through AgentMessage events
                 // We mark as completed when a new tool call begins
+            }
+            EventMsg::ImageGenerationBegin(event) => {
+                info!("Image generation started: call_id={}", event.call_id);
+                self.start_image_generation(client, event);
+            }
+            EventMsg::ImageGenerationEnd(event) => {
+                info!(
+                    "Image generation ended: call_id={}, status={}",
+                    event.call_id, event.status
+                );
+                self.end_image_generation(client, event);
             }
             EventMsg::ExecApprovalRequest(event) => {
                 info!(
@@ -1402,7 +1555,7 @@ impl PromptState {
                 );
                 self.terminal_interaction(client, event);
             }
-            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, namespace, tool, arguments }) => {
+            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, namespace, tool, arguments, started_at_ms: _ }) => {
                 info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, namespace={namespace:?}, tool={tool}");
                 self.start_dynamic_tool_call(client, call_id, tool, arguments);
             }
@@ -1474,6 +1627,7 @@ impl PromptState {
                 thread_id,
                 turn_id,
                 item,
+                completed_at_ms: _,
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
@@ -1487,21 +1641,6 @@ impl PromptState {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
                 self.completed = true;
-            }
-            EventMsg::UndoStarted(event) => {
-                client.send_agent_text(
-                    event
-                        .message
-                        .unwrap_or_else(|| "Undo in progress...".to_string()),
-                );
-            }
-            EventMsg::UndoCompleted(event) => {
-                let fallback = if event.success {
-                    "Undo completed.".to_string()
-                } else {
-                    "Undo failed.".to_string()
-                };
-                client.send_agent_text(event.message.unwrap_or(fallback));
             }
             EventMsg::StreamError(StreamErrorEvent {
                 message,
@@ -1620,34 +1759,6 @@ impl PromptState {
                 );
                 self.guardian_assessment(client, event);
             }
-            EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
-                thread_id,
-                turn_id,
-                goal,
-            }) => {
-                info!(
-                    "Thread goal updated: thread_id={thread_id}, turn_id={turn_id:?}, status={:?}",
-                    goal.status
-                );
-                client.send_thread_goal_updated(&thread_id, turn_id, &goal);
-            }
-            EventMsg::ImageGenerationBegin(event) => {
-                info!("Image generation started: call_id={}", event.call_id);
-                client.send_image_generation_begin(event.call_id);
-            }
-            EventMsg::ImageGenerationEnd(event) => {
-                info!(
-                    "Image generation ended: call_id={}, status={}, saved_path={:?}",
-                    event.call_id, event.status, event.saved_path
-                );
-                client.send_image_generation_end(
-                    event.call_id,
-                    event.status,
-                    event.revised_prompt,
-                    event.saved_path.map(|path| path.display().to_string()),
-                );
-            }
-
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
             | EventMsg::ThreadRolledBack(..)
@@ -1655,13 +1766,8 @@ impl PromptState {
             | EventMsg::HookCompleted(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
-            // Revisit when we can emit status updates
-            | EventMsg::BackgroundEvent(..)
             | EventMsg::SkillsUpdateAvailable
             // Old events
-            | EventMsg::AgentMessageDelta(..)
-            | EventMsg::AgentReasoningDelta(..)
-            | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
             // TODO: Subagent UI?
@@ -1680,11 +1786,7 @@ impl PromptState {
             | EventMsg::CollabCloseBegin(..)
             | EventMsg::CollabCloseEnd(..)
             | EventMsg::PlanDelta(..)=> {}
-            e @ (EventMsg::McpListToolsResponse(..)
-            | EventMsg::ListSkillsResponse(..)
-            | EventMsg::RealtimeConversationListVoicesResponse(..)
-            // Used for returning a single history entry
-            | EventMsg::GetHistoryEntryResponse(..)
+            e @ (EventMsg::RealtimeConversationListVoicesResponse(..)
             | EventMsg::DeprecationNotice(..)
             | EventMsg::RequestUserInput(..)) => {
                 warn!("Unexpected event: {:?}", e);
@@ -1947,6 +2049,7 @@ impl PromptState {
             turn_id: _,
             tool: _,
             arguments: _,
+            completed_at_ms: _,
             namespace: _,
             content_items,
             success,
@@ -2153,6 +2256,7 @@ impl PromptState {
             interaction_input: _,
             call_id,
             command: _,
+            started_at_ms: _,
             cwd,
             parsed_cmd,
             process_id: _,
@@ -2214,8 +2318,8 @@ impl PromptState {
         if let Some(active_command) = self.active_commands.get_mut(&call_id) {
             let data_str = String::from_utf8_lossy(&chunk).to_string();
 
-            let update = if client.supports_terminal_output(active_command) {
-                ToolCallUpdate::new(
+            if client.supports_terminal_output(active_command) {
+                let update = ToolCallUpdate::new(
                     active_command.tool_call_id.clone(),
                     ToolCallUpdateFields::new(),
                 )
@@ -2225,27 +2329,15 @@ impl PromptState {
                         "terminal_id": call_id,
                         "data": data_str
                     }),
-                )]))
+                )]));
+                client.send_tool_call_update(update);
             } else {
+                // Fallback path (no terminal_output capability): accumulate locally
+                // and emit a single ToolCallUpdate at exec_command_end. Resending the
+                // entire accumulated buffer per chunk is O(N²) memory and crashes the
+                // process on large outputs (issue #225).
                 active_command.output.push_str(&data_str);
-                let content = match active_command.file_extension.as_deref() {
-                    Some("md") => active_command.output.clone(),
-                    Some(ext) => format!(
-                        "```{ext}\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                    None => format!(
-                        "```sh\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                };
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new().content(vec![content.into()]),
-                )
-            };
-
-            client.send_tool_call_update(update);
+            }
         }
     }
 
@@ -2266,6 +2358,7 @@ impl PromptState {
             duration: _,
             formatted_output: _,
             process_id: _,
+            completed_at_ms: _,
             status,
         } = event;
         if let Some(active_command) = self.active_commands.remove(&call_id) {
@@ -2277,15 +2370,35 @@ impl PromptState {
                 ExecCommandStatus::Failed | ExecCommandStatus::Declined => ToolCallStatus::Failed,
             };
 
+            let supports_terminal = client.supports_terminal_output(&active_command);
+
+            let mut fields = ToolCallUpdateFields::new()
+                .status(status)
+                .raw_output(raw_output);
+
+            // For the non-terminal fallback path the per-chunk delta handler now
+            // accumulates silently (see exec_command_output_delta). Emit the full
+            // buffer here, exactly once, as a single content block. Skip the emission
+            // entirely when the command produced no output, so we don't surface an
+            // empty fenced code block to the client.
+            if !supports_terminal && !active_command.output.is_empty() {
+                let content = match active_command.file_extension.as_deref() {
+                    Some("md") => active_command.output.clone(),
+                    Some(ext) => format!(
+                        "```{ext}\n{}\n```\n",
+                        active_command.output.trim_end_matches('\n')
+                    ),
+                    None => format!(
+                        "```sh\n{}\n```\n",
+                        active_command.output.trim_end_matches('\n')
+                    ),
+                };
+                fields = fields.content(vec![content.into()]);
+            }
+
             client.send_tool_call_update(
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new()
-                        .status(status)
-                        .raw_output(raw_output),
-                )
-                .meta(client.supports_terminal_output(&active_command).then(
-                    || {
+                ToolCallUpdate::new(active_command.tool_call_id.clone(), fields).meta(
+                    supports_terminal.then(|| {
                         Meta::from_iter([(
                             "terminal_exit".into(),
                             serde_json::json!({
@@ -2294,8 +2407,8 @@ impl PromptState {
                                 "signal": null
                             }),
                         )])
-                    },
-                )),
+                    }),
+                ),
             );
         }
     }
@@ -2348,6 +2461,50 @@ impl PromptState {
     fn start_web_search(&mut self, client: &SessionClient, call_id: String) {
         self.active_web_search = Some(call_id.clone());
         client.send_tool_call(ToolCall::new(call_id, "Searching the Web").kind(ToolKind::Fetch));
+    }
+
+    fn start_image_generation(&mut self, client: &SessionClient, event: ImageGenerationBeginEvent) {
+        let raw_input = serde_json::json!(&event);
+        let ImageGenerationBeginEvent { call_id } = event;
+        self.active_image_generations.insert(call_id.clone());
+        client.send_tool_call(
+            ToolCall::new(call_id, "Image generation")
+                .kind(ToolKind::Other)
+                .status(ToolCallStatus::InProgress)
+                .raw_input(raw_input),
+        );
+    }
+
+    fn end_image_generation(&mut self, client: &SessionClient, event: ImageGenerationEndEvent) {
+        let raw_output = serde_json::json!(&event);
+        let ImageGenerationEndEvent {
+            call_id,
+            status,
+            revised_prompt,
+            result,
+            saved_path,
+        } = event;
+        let tool_status = image_generation_tool_status(&status);
+        let saved_path = saved_path.map(|path| path.to_string_lossy().into_owned());
+        let content = image_generation_content(revised_prompt, result, saved_path);
+
+        if self.active_image_generations.remove(&call_id) {
+            client.send_tool_call_update(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(tool_status)
+                    .content(content)
+                    .raw_output(raw_output),
+            ));
+        } else {
+            client.send_tool_call(
+                ToolCall::new(call_id, "Image generation")
+                    .kind(ToolKind::Other)
+                    .status(tool_status)
+                    .content(content)
+                    .raw_output(raw_output),
+            );
+        }
     }
 
     fn update_web_search_query(
@@ -2815,35 +2972,6 @@ impl SessionClient {
         self.send_ext_notification(method, Arc::from(raw_value));
     }
 
-    fn send_image_generation_begin(&self, call_id: String) {
-        self.send_json_ext_notification(
-            IMAGE_GENERATION_BEGIN_METHOD,
-            &ImageGenerationBeginPayload {
-                session_id: self.session_id.0.to_string(),
-                call_id,
-            },
-        );
-    }
-
-    fn send_image_generation_end(
-        &self,
-        call_id: String,
-        status: String,
-        revised_prompt: Option<String>,
-        saved_path: Option<String>,
-    ) {
-        self.send_json_ext_notification(
-            IMAGE_GENERATION_END_METHOD,
-            &ImageGenerationEndPayload {
-                session_id: self.session_id.0.to_string(),
-                call_id,
-                status,
-                revised_prompt,
-                saved_path,
-            },
-        );
-    }
-
     fn send_thread_goal_updated(
         &self,
         thread_id: &ThreadId,
@@ -3090,6 +3218,21 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_set_config_option(config_id, value).await;
                 drop(response_tx.send(result));
             }
+            ThreadMessage::GetThreadGoal { response_tx } => {
+                let result = self.get_thread_goal_snapshot().await;
+                drop(response_tx.send(result));
+            }
+            ThreadMessage::SetThreadGoalStatus {
+                status,
+                response_tx,
+            } => {
+                let result = self.set_thread_goal_status_from_client(status).await;
+                drop(response_tx.send(result));
+            }
+            ThreadMessage::ClearThreadGoal { response_tx } => {
+                let result = self.clear_thread_goal_from_client().await;
+                drop(response_tx.send(result));
+            }
             ThreadMessage::Cancel { response_tx } => {
                 let result = self.handle_cancel().await;
                 drop(response_tx.send(result));
@@ -3157,7 +3300,6 @@ impl<A: Auth> ThreadActor<A> {
                 "compact",
                 "summarize conversation to prevent hitting the context limit",
             ),
-            AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
         ];
 
@@ -3174,29 +3316,7 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     fn modes(&self) -> Option<SessionModeState> {
-        let current_mode_id = APPROVAL_PRESETS
-            .iter()
-            .find(|preset| {
-                std::mem::discriminant(&preset.approval)
-                    == std::mem::discriminant(self.config.permissions.approval_policy.get())
-                    && preset.permission_profile == self.config.permissions.permission_profile()
-            })
-            .or_else(|| {
-                // When the project is untrusted, the above code won't match
-                // since AskForApproval::UnlessTrusted is not part of the
-                // default presets. However, in this case we still want to show
-                // the mode selector, which allows the user to choose a
-                // different mode (which will set the project to be trusted)
-                // See https://github.com/zed-industries/zed/issues/48132
-                if self.config.active_project.is_untrusted() {
-                    APPROVAL_PRESETS
-                        .iter()
-                        .find(|preset| preset.id == "read-only")
-                } else {
-                    None
-                }
-            })
-            .map(|preset| SessionModeId::new(preset.id))?;
+        let current_mode_id = current_session_mode_id(&self.config)?;
 
         Some(SessionModeState::new(
             current_mode_id,
@@ -3297,7 +3417,11 @@ impl<A: Auth> ThreadActor<A> {
             SessionConfigOption::boolean(
                 FAST_MODE_CONFIG_ID,
                 "Fast Mode",
-                matches!(self.config.service_tier, Some(ServiceTier::Fast)),
+                self.config
+                    .service_tier
+                    .as_deref()
+                    .and_then(ServiceTier::from_request_value)
+                    == Some(ServiceTier::Fast),
             )
             .description("Use the fastest inference tier for future turns"),
         );
@@ -3387,7 +3511,9 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_set_fast_mode(&mut self, enabled: bool) -> Result<(), Error> {
-        let service_tier = enabled.then_some(ServiceTier::Fast);
+        let service_tier = enabled
+            .then_some(ServiceTier::Fast)
+            .map(|t| t.request_value().to_string());
 
         self.thread
             .submit(Op::OverrideTurnContext {
@@ -3401,7 +3527,7 @@ impl<A: Auth> ThreadActor<A> {
                 collaboration_mode: None,
                 personality: None,
                 windows_sandbox_level: None,
-                service_tier: Some(service_tier),
+                service_tier: Some(service_tier.clone()),
                 approvals_reviewer: None,
             })
             .await
@@ -3592,7 +3718,6 @@ impl<A: Auth> ThreadActor<A> {
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
                 "compact" => op = Op::Compact,
-                "undo" => op = Op::Undo,
                 "init" => {
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
@@ -3743,12 +3868,7 @@ impl<A: Auth> ThreadActor<A> {
             ));
         }
 
-        let thread_id = self.thread_id.ok_or_else(|| {
-            Error::internal_error().data("ACP session id is not a valid Codex thread id")
-        })?;
-        let state_db = self.thread.state_db().ok_or_else(|| {
-            Error::internal_error().data("sqlite state db unavailable for thread goals")
-        })?;
+        let (thread_id, state_db) = self.thread_goal_context()?;
 
         let trimmed = args.trim();
         match trimmed.to_ascii_lowercase().as_str() {
@@ -3778,6 +3898,51 @@ impl<A: Auth> ThreadActor<A> {
                     .await
             }
         }
+    }
+
+    fn thread_goal_context(&self) -> Result<(ThreadId, StateDbHandle), Error> {
+        if !self.config.features.enabled(Feature::Goals) {
+            return Err(Error::invalid_params().data(
+                "Thread goals are disabled. Enable the Codex `goals` feature to use goals.",
+            ));
+        }
+
+        let thread_id = self.thread_id.ok_or_else(|| {
+            Error::internal_error().data("ACP session id is not a valid Codex thread id")
+        })?;
+        let state_db = self.thread.state_db().ok_or_else(|| {
+            Error::internal_error().data("sqlite state db unavailable for thread goals")
+        })?;
+
+        Ok((thread_id, state_db))
+    }
+
+    async fn get_thread_goal_snapshot(&self) -> Result<Option<ThreadGoal>, Error> {
+        let (thread_id, state_db) = self.thread_goal_context()?;
+        let goal = state_db
+            .get_thread_goal(thread_id)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        Ok(goal.map(protocol_thread_goal_from_state))
+    }
+
+    async fn set_thread_goal_status_from_client(
+        &mut self,
+        status: ThreadGoalStatus,
+    ) -> Result<(), Error> {
+        let (thread_id, state_db) = self.thread_goal_context()?;
+        let status = state_thread_goal_status_from_protocol(status)?;
+        self.set_thread_goal_status(thread_id, &state_db, status)
+            .await?
+            .map_or(Ok(()), |message| Err(Error::invalid_params().data(message)))
+    }
+
+    async fn clear_thread_goal_from_client(&mut self) -> Result<(), Error> {
+        let (thread_id, state_db) = self.thread_goal_context()?;
+        self.clear_thread_goal(thread_id, &state_db)
+            .await
+            .map(|_| ())
     }
 
     async fn describe_thread_goal(
@@ -3811,10 +3976,13 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         self.thread.prepare_external_goal_mutation().await;
-        let goal = if let Some(previous_goal) = previous.as_ref().filter(|goal| {
-            goal.objective == objective && goal.status != codex_state::ThreadGoalStatus::Complete
-        }) {
-            state_db
+        let (goal, previous_status) = if let Some(previous_goal) =
+            previous.as_ref().filter(|goal| {
+                goal.objective == objective
+                    && goal.status != codex_state::ThreadGoalStatus::Complete
+            }) {
+            let previous_status = ExternalGoalPreviousStatus::Existing(previous_goal.status);
+            let goal = state_db
                 .update_thread_goal(
                     thread_id,
                     codex_state::ThreadGoalUpdate {
@@ -3825,9 +3993,10 @@ impl<A: Auth> ThreadActor<A> {
                 )
                 .await
                 .map_err(|e| Error::internal_error().data(e.to_string()))?
-                .ok_or_else(|| Error::internal_error().data("thread goal disappeared"))?
+                .ok_or_else(|| Error::internal_error().data("thread goal disappeared"))?;
+            (goal, previous_status)
         } else {
-            state_db
+            let goal = state_db
                 .replace_thread_goal(
                     thread_id,
                     objective,
@@ -3835,10 +4004,16 @@ impl<A: Auth> ThreadActor<A> {
                     None,
                 )
                 .await
-                .map_err(|e| Error::internal_error().data(e.to_string()))?
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            (goal, ExternalGoalPreviousStatus::NewGoal)
         };
 
-        self.thread.apply_external_goal_set(goal.status).await;
+        self.thread
+            .apply_external_goal_set(ExternalGoalSet {
+                goal: goal.clone(),
+                previous_status,
+            })
+            .await;
         let goal = protocol_thread_goal_from_state(goal);
         self.client
             .send_thread_goal_updated(&thread_id, None, &goal);
@@ -3851,6 +4026,17 @@ impl<A: Auth> ThreadActor<A> {
         state_db: &StateDbHandle,
         status: codex_state::ThreadGoalStatus,
     ) -> Result<Option<String>, Error> {
+        let existing = state_db
+            .get_thread_goal(thread_id)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        let Some(existing) = existing else {
+            return Ok(Some(
+                "No goal is currently set. Use `/goal <objective>` to create one.".to_string(),
+            ));
+        };
+        let previous_status = ExternalGoalPreviousStatus::Existing(existing.status);
+
         self.thread.prepare_external_goal_mutation().await;
         let goal = state_db
             .update_thread_goal(
@@ -3858,7 +4044,7 @@ impl<A: Auth> ThreadActor<A> {
                 codex_state::ThreadGoalUpdate {
                     status: Some(status),
                     token_budget: None,
-                    expected_goal_id: None,
+                    expected_goal_id: Some(existing.goal_id.clone()),
                 },
             )
             .await
@@ -3870,7 +4056,12 @@ impl<A: Auth> ThreadActor<A> {
             ));
         };
 
-        self.thread.apply_external_goal_set(goal.status).await;
+        self.thread
+            .apply_external_goal_set(ExternalGoalSet {
+                goal: goal.clone(),
+                previous_status,
+            })
+            .await;
         let goal = protocol_thread_goal_from_state(goal);
         self.client
             .send_thread_goal_updated(&thread_id, None, &goal);
@@ -3888,9 +4079,10 @@ impl<A: Auth> ThreadActor<A> {
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
+        self.thread.apply_external_goal_clear().await;
+        self.client.send_thread_goal_cleared(&thread_id);
+
         if cleared {
-            self.thread.apply_external_goal_clear().await;
-            self.client.send_thread_goal_cleared(&thread_id);
             Ok(None)
         } else {
             Ok(Some(
@@ -3909,6 +4101,7 @@ impl<A: Auth> ThreadActor<A> {
             .submit(Op::OverrideTurnContext {
                 cwd: None,
                 approval_policy: Some(preset.approval),
+                permission_profile: Some(preset.permission_profile.clone()),
                 sandbox_policy: None,
                 model: None,
                 effort: None,
@@ -3918,7 +4111,6 @@ impl<A: Auth> ThreadActor<A> {
                 windows_sandbox_level: None,
                 service_tier: None,
                 approvals_reviewer: None,
-                permission_profile: Some(preset.permission_profile.clone()),
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3930,11 +4122,13 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         self.config
             .permissions
-            .set_permission_profile(preset.permission_profile.clone())
+            .set_permission_profile_with_active_profile(
+                preset.permission_profile.clone(),
+                active_profile_id_for_session_mode(preset.id).map(ActivePermissionProfile::new),
+            )
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        // Treat switching to a writable preset as a trust decision for the current project.
-        if preset.id != "read-only" {
+        if mode_trusts_project(preset.id) {
             set_project_trust_level(
                 &self.config.codex_home,
                 &self.config.cwd,
@@ -4086,6 +4280,10 @@ impl<A: Auth> ThreadActor<A> {
             }
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
                 self.client.send_agent_thought(text.clone());
+            }
+            EventMsg::ThreadGoalUpdated(event) => {
+                self.client
+                    .send_agent_text(format_thread_goal_update(event));
             }
             // Skip other event types during replay - they either:
             // - Are transient (deltas, turn lifecycle)
@@ -4348,6 +4546,28 @@ impl<A: Auth> ThreadActor<A> {
                     ToolCall::new(call_id, title)
                         .kind(ToolKind::Search)
                         .status(ToolCallStatus::Completed),
+                );
+            }
+            ResponseItem::ImageGenerationCall {
+                id,
+                status,
+                revised_prompt,
+                result,
+            } => {
+                self.client.send_tool_call(
+                    ToolCall::new(id.clone(), "Image generation")
+                        .kind(ToolKind::Other)
+                        .status(image_generation_tool_status(status))
+                        .content(image_generation_content(
+                            revised_prompt.clone(),
+                            result.clone(),
+                            None,
+                        ))
+                        .raw_output(serde_json::json!({
+                            "status": status,
+                            "revised_prompt": revised_prompt,
+                            "result": result,
+                        })),
                 );
             }
             // Skip GhostSnapshot, Compaction, Other, LocalShellCall without call_id
@@ -4672,6 +4892,19 @@ fn thread_goal_status_from_state(status: codex_state::ThreadGoalStatus) -> Threa
     }
 }
 
+fn state_thread_goal_status_from_protocol(
+    status: ThreadGoalStatus,
+) -> Result<codex_state::ThreadGoalStatus, Error> {
+    match status {
+        ThreadGoalStatus::Active => Ok(codex_state::ThreadGoalStatus::Active),
+        ThreadGoalStatus::Paused => Ok(codex_state::ThreadGoalStatus::Paused),
+        ThreadGoalStatus::BudgetLimited | ThreadGoalStatus::Complete => {
+            Err(Error::invalid_params()
+                .data("thread/goal/set only supports active or paused status"))
+        }
+    }
+}
+
 fn thread_goal_status_label(status: ThreadGoalStatus) -> &'static str {
     match status {
         ThreadGoalStatus::Active => "active",
@@ -4774,6 +5007,45 @@ fn web_search_action_to_title_and_id(
     }
 }
 
+fn image_generation_tool_status(status: &str) -> ToolCallStatus {
+    match status {
+        "completed" => ToolCallStatus::Completed,
+        "generating" | "in_progress" | "incomplete" => ToolCallStatus::InProgress,
+        "failed" => ToolCallStatus::Failed,
+        _ => ToolCallStatus::Completed,
+    }
+}
+
+fn image_generation_content(
+    revised_prompt: Option<String>,
+    result: String,
+    saved_path: Option<String>,
+) -> Vec<ToolCallContent> {
+    let mut content = Vec::new();
+
+    if let Some(revised_prompt) = revised_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        content.push(ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new(format!("Revised prompt: {revised_prompt}")),
+        ))));
+    }
+
+    if !result.is_empty() {
+        let mut image = ImageContent::new(result, "image/png");
+        if let Some(saved_path) = saved_path
+            .as_ref()
+            .filter(|saved_path| !saved_path.trim().is_empty())
+        {
+            image = image.uri(saved_path.clone());
+        }
+
+        content.push(ToolCallContent::Content(Content::new(ContentBlock::Image(
+            image,
+        ))));
+    }
+
+    content
+}
+
 /// Generate a fallback ID using UUID (used when id is missing)
 fn generate_fallback_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
@@ -4807,6 +5079,7 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -4814,6 +5087,7 @@ mod tests {
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::{ThreadId, protocol::ThreadGoal};
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
@@ -4843,6 +5117,111 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_thread_goal_updated_is_sent_as_agent_message() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["thread-goal-update".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "Goal updated (active): Ship the goal update"
+            )
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_image_generation_emits_image_content() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        let expected_uri = image_generation_test_saved_path()
+            .to_string_lossy()
+            .into_owned();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["image-generation".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_call = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool_call)
+                    if tool_call.tool_call_id.0.as_ref() == "ig-1" =>
+                {
+                    Some(tool_call)
+                }
+                _ => None,
+            })
+            .expect("image generation tool call should be sent");
+        assert_eq!(tool_call.title, "Image generation");
+        assert_eq!(tool_call.status, ToolCallStatus::InProgress);
+
+        let update = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update)
+                    if update.tool_call_id.0.as_ref() == "ig-1" =>
+                {
+                    Some(update)
+                }
+                _ => None,
+            })
+            .expect("image generation tool call update should be sent");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+        let content = update
+            .fields
+            .content
+            .as_ref()
+            .expect("image generation update should include content");
+        assert_eq!(content.len(), 2);
+        assert!(matches!(
+            &content[0],
+            ToolCallContent::Content(Content {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Revised prompt: A tiny blue square"
+        ));
+        assert!(matches!(
+            &content[1],
+            ToolCallContent::Content(Content {
+                content: ContentBlock::Image(ImageContent {
+                    data,
+                    mime_type,
+                    uri,
+                    ..
+                }),
+                ..
+            }) if data == "Zm9v" && mime_type == "image/png" && uri.as_deref() == Some(expected_uri.as_str())
+        ));
+
+        Ok(())
+    }
+
+    fn image_generation_test_saved_path() -> PathBuf {
+        std::env::temp_dir().join("ig-1.png")
     }
 
     #[tokio::test]
@@ -5049,6 +5428,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_thread_goal_control_messages_pause_resume_and_idempotent_clear()
+    -> anyhow::Result<()> {
+        let thread_id = ThreadId::new();
+        let session_id = SessionId::new(thread_id.to_string());
+        let state_db = test_state_db(thread_id).await?;
+        state_db
+            .replace_thread_goal(
+                thread_id,
+                "ship the release",
+                codex_state::ThreadGoalStatus::Active,
+                None,
+            )
+            .await?;
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::with_state_db(state_db.clone()));
+        let models_manager = Arc::new(StubModelsManager);
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.features.enable(Feature::Goals)?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+        let _handle = tokio::spawn(actor.spawn());
+
+        let (get_response_tx, get_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::GetThreadGoal {
+            response_tx: get_response_tx,
+        })?;
+        let goal = get_response_rx.await??.expect("goal should exist");
+        assert_eq!(goal.objective, "ship the release");
+        assert_eq!(goal.status, ThreadGoalStatus::Active);
+
+        for status in [ThreadGoalStatus::Paused, ThreadGoalStatus::Active] {
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            message_tx.send(ThreadMessage::SetThreadGoalStatus {
+                status,
+                response_tx,
+            })?;
+            response_rx.await??;
+        }
+
+        for _ in 0..2 {
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            message_tx.send(ThreadMessage::ClearThreadGoal { response_tx })?;
+            response_rx.await??;
+        }
+
+        assert!(state_db.get_thread_goal(thread_id).await?.is_none());
+        assert_eq!(
+            thread.applied_goal_sets.lock().unwrap().as_slice(),
+            &[
+                codex_state::ThreadGoalStatus::Paused,
+                codex_state::ThreadGoalStatus::Active,
+            ]
+        );
+        assert_eq!(
+            thread
+                .applied_goal_clears
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+
+        let ext_notifications = client.ext_notifications.lock().unwrap();
+        assert_eq!(ext_notifications.len(), 4);
+        assert_eq!(
+            ext_notifications[0].method.as_ref(),
+            "_acp_ext:thread_goal_updated"
+        );
+        assert_eq!(
+            ext_notifications[1].method.as_ref(),
+            "_acp_ext:thread_goal_updated"
+        );
+        assert_eq!(
+            ext_notifications[2].method.as_ref(),
+            "_acp_ext:thread_goal_cleared"
+        );
+        assert_eq!(
+            ext_notifications[3].method.as_ref(),
+            "_acp_ext:thread_goal_cleared"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_thread_goal_updated_event_sends_ext_notification() -> anyhow::Result<()> {
         let thread_id = ThreadId::new();
         let session_id = SessionId::new(thread_id.to_string());
@@ -5094,70 +5572,6 @@ mod tests {
         assert_eq!(params["goal"]["tokenBudget"], 42_000);
         assert_eq!(params["goal"]["tokensUsed"], 21_000);
         assert_eq!(params["goal"]["timeUsedSeconds"], 123);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_image_generation_events_send_ext_notifications() -> anyhow::Result<()> {
-        let thread_id = ThreadId::new();
-        let session_id = SessionId::new(thread_id.to_string());
-        let client = Arc::new(StubClient::new());
-        let session_client =
-            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
-        let thread = Arc::new(StubCodexThread::new());
-        let (resolution_tx, _resolution_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
-        let mut state =
-            PromptState::new("submission".to_string(), thread, resolution_tx, response_tx);
-
-        state
-            .handle_event(
-                &session_client,
-                EventMsg::ImageGenerationBegin(
-                    codex_protocol::protocol::ImageGenerationBeginEvent {
-                        call_id: "ig_1".to_string(),
-                    },
-                ),
-            )
-            .await;
-        state
-            .handle_event(
-                &session_client,
-                EventMsg::ImageGenerationEnd(codex_protocol::protocol::ImageGenerationEndEvent {
-                    call_id: "ig_1".to_string(),
-                    status: "completed".to_string(),
-                    revised_prompt: Some("diagram".to_string()),
-                    result: "base64-result-should-not-be-forwarded".to_string(),
-                    saved_path: Some("/tmp/codex-image.png".try_into()?),
-                }),
-            )
-            .await;
-
-        let ext_notifications = client.ext_notifications.lock().unwrap();
-        assert_eq!(ext_notifications.len(), 2);
-        assert_eq!(
-            ext_notifications[0].method.as_ref(),
-            "_acp_ext:image_generation_begin"
-        );
-        assert_eq!(
-            ext_notifications[1].method.as_ref(),
-            "_acp_ext:image_generation_end"
-        );
-
-        let begin_params: serde_json::Value =
-            serde_json::from_str(ext_notifications[0].params.get())?;
-        assert_eq!(begin_params["sessionId"], session_id.0.as_ref());
-        assert_eq!(begin_params["callId"], "ig_1");
-
-        let end_params: serde_json::Value =
-            serde_json::from_str(ext_notifications[1].params.get())?;
-        assert_eq!(end_params["sessionId"], session_id.0.as_ref());
-        assert_eq!(end_params["callId"], "ig_1");
-        assert_eq!(end_params["status"], "completed");
-        assert_eq!(end_params["revisedPrompt"], "diagram");
-        assert_eq!(end_params["savedPath"], "/tmp/codex-image.png");
-        assert!(end_params.get("result").is_none());
 
         Ok(())
     }
@@ -5352,44 +5766,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_undo() -> anyhow::Result<()> {
-        let (session_id, client, thread, message_tx, _handle) = setup().await?;
-        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+    async fn modes_match_augmented_workspace_permission_profile() -> anyhow::Result<()> {
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config
+            .permissions
+            .approval_policy
+            .set(codex_protocol::protocol::AskForApproval::OnRequest)?;
 
-        message_tx.send(ThreadMessage::Prompt {
-            request: PromptRequest::new(session_id.clone(), vec!["/undo".into()]),
-            response_tx: prompt_response_tx,
-        })?;
-
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
-        drop(message_tx);
-
-        let notifications = client.notifications.lock().unwrap();
-        assert_eq!(
-            notifications.len(),
-            2,
-            "notifications don't match {notifications:?}"
+        let workspace_profile = PermissionProfile::workspace_write();
+        let extra_roots = vec![config.codex_home.as_path().join("memories").try_into()?];
+        let file_system_policy = workspace_profile
+            .file_system_sandbox_policy()
+            .with_additional_writable_roots(config.cwd.as_path(), &extra_roots);
+        let augmented_profile = PermissionProfile::from_runtime_permissions(
+            &file_system_policy,
+            workspace_profile.network_sandbox_policy(),
         );
-        assert!(matches!(
-            &notifications[0].update,
-            SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent { text, .. }),
-                ..
-            }) if text == "Undo in progress..."
-        ));
-        assert!(matches!(
-            &notifications[1].update,
-            SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent { text, .. }),
-                ..
-            }) if text == "Undo completed."
-        ));
+        assert_ne!(augmented_profile, workspace_profile);
 
-        let ops = thread.ops.lock().unwrap();
-        assert_eq!(ops.as_slice(), &[Op::Undo]);
+        config
+            .permissions
+            .set_permission_profile_with_active_profile(
+                augmented_profile,
+                Some(ActivePermissionProfile::new(CODEX_WORKSPACE_PROFILE_ID)),
+            )?;
+
+        let mode_id = current_session_mode_id(&config).expect("mode should be recognized");
+        assert_eq!(mode_id.0.as_ref(), "auto");
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn modes_match_legacy_augmented_workspace_permission_profile() -> anyhow::Result<()> {
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config
+            .permissions
+            .approval_policy
+            .set(codex_protocol::protocol::AskForApproval::OnRequest)?;
+
+        let workspace_profile = PermissionProfile::workspace_write();
+        let extra_roots = vec![config.codex_home.as_path().join("memories").try_into()?];
+        let file_system_policy = workspace_profile
+            .file_system_sandbox_policy()
+            .with_additional_writable_roots(config.cwd.as_path(), &extra_roots);
+        let augmented_profile = PermissionProfile::from_runtime_permissions(
+            &file_system_policy,
+            workspace_profile.network_sandbox_policy(),
+        );
+        assert_ne!(augmented_profile, workspace_profile);
+
+        config
+            .permissions
+            .set_permission_profile(augmented_profile)?;
+        assert!(config.permissions.active_permission_profile().is_none());
+
+        let mode_id = current_session_mode_id(&config).expect("mode should be recognized");
+        assert_eq!(mode_id.0.as_ref(), "auto");
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_mode_does_not_trust_project() {
+        assert!(!mode_trusts_project("read-only"));
+        assert!(mode_trusts_project("auto"));
+        assert!(mode_trusts_project("full-access"));
     }
 
     #[tokio::test]
@@ -5707,8 +6157,8 @@ mod tests {
     struct StubAuth;
 
     impl Auth for StubAuth {
-        fn logout(&self) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>> {
-            Box::pin(async { Ok(true) })
+        async fn logout(&self) -> Result<bool, Error> {
+            Ok(true)
         }
     }
 
@@ -5811,6 +6261,7 @@ mod tests {
                                 }],
                                 source: Default::default(),
                                 interaction_input: None,
+                                started_at_ms: 0,
                             }));
                             send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                                 call_id: "call-b".into(),
@@ -5823,6 +6274,7 @@ mod tests {
                                 }],
                                 source: Default::default(),
                                 interaction_input: None,
+                                started_at_ms: 0,
                             }));
                             send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                                 call_id: "call-a".into(),
@@ -5840,6 +6292,7 @@ mod tests {
                                 duration: std::time::Duration::from_millis(10),
                                 formatted_output: "a\n".into(),
                                 status: ExecCommandStatus::Completed,
+                                completed_at_ms: 0,
                             }));
                             send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                                 call_id: "call-b".into(),
@@ -5857,6 +6310,7 @@ mod tests {
                                 duration: std::time::Duration::from_millis(10),
                                 formatted_output: "b\n".into(),
                                 status: ExecCommandStatus::Completed,
+                                completed_at_ms: 0,
                             }));
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
@@ -5865,6 +6319,68 @@ mod tests {
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
                             }));
+                        } else if prompt == "image-generation" {
+                            let turn_id = id.to_string();
+                            let saved_path = image_generation_test_saved_path();
+                            let send = |msg| {
+                                self.op_tx
+                                    .send(Event {
+                                        id: id.to_string(),
+                                        msg,
+                                    })
+                                    .unwrap();
+                            };
+                            send(EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
+                                call_id: "ig-1".into(),
+                            }));
+                            send(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+                                call_id: "ig-1".into(),
+                                status: "completed".into(),
+                                revised_prompt: Some("A tiny blue square".into()),
+                                result: "Zm9v".into(),
+                                saved_path: Some(saved_path.try_into()?),
+                            }));
+                            send(EventMsg::TurnComplete(TurnCompleteEvent {
+                                last_agent_message: None,
+                                turn_id,
+                                completed_at: None,
+                                duration_ms: None,
+                                time_to_first_token_ms: None,
+                            }));
+                        } else if prompt == "thread-goal-update" {
+                            let turn_id = id.to_string();
+                            let thread_id = ThreadId::default();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                                        thread_id,
+                                        turn_id: Some(turn_id.clone()),
+                                        goal: ThreadGoal {
+                                            thread_id,
+                                            objective: "Ship the goal update".to_string(),
+                                            status: ThreadGoalStatus::Active,
+                                            token_budget: Some(100),
+                                            tokens_used: 10,
+                                            time_used_seconds: 2,
+                                            created_at: 1,
+                                            updated_at: 2,
+                                        },
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                        last_agent_message: None,
+                                        turn_id,
+                                        completed_at: None,
+                                        duration_ms: None,
+                                        time_to_first_token_ms: None,
+                                    }),
+                                })
+                                .unwrap();
                         } else if prompt == "approval-block" {
                             self.op_tx
                                 .send(Event {
@@ -5949,41 +6465,6 @@ mod tests {
                                     phase: None,
                                     memory_citation: None,
                                 }),
-                            })
-                            .unwrap();
-                        self.op_tx
-                            .send(Event {
-                                id: id.to_string(),
-                                msg: EventMsg::TurnComplete(TurnCompleteEvent {
-                                    last_agent_message: None,
-                                    turn_id: id.to_string(),
-                                    completed_at: None,
-                                    duration_ms: None,
-                                    time_to_first_token_ms: None,
-                                }),
-                            })
-                            .unwrap();
-                    }
-                    Op::Undo => {
-                        self.op_tx
-                            .send(Event {
-                                id: id.to_string(),
-                                msg: EventMsg::UndoStarted(
-                                    codex_protocol::protocol::UndoStartedEvent {
-                                        message: Some("Undo in progress...".to_string()),
-                                    },
-                                ),
-                            })
-                            .unwrap();
-                        self.op_tx
-                            .send(Event {
-                                id: id.to_string(),
-                                msg: EventMsg::UndoCompleted(
-                                    codex_protocol::protocol::UndoCompletedEvent {
-                                        success: true,
-                                        message: Some("Undo completed.".to_string()),
-                                    },
-                                ),
                             })
                             .unwrap();
                         self.op_tx
@@ -6112,10 +6593,13 @@ mod tests {
 
         fn apply_external_goal_set(
             &self,
-            status: codex_state::ThreadGoalStatus,
+            external_set: ExternalGoalSet,
         ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             Box::pin(async move {
-                self.applied_goal_sets.lock().unwrap().push(status);
+                self.applied_goal_sets
+                    .lock()
+                    .unwrap()
+                    .push(external_set.goal.status);
             })
         }
 
