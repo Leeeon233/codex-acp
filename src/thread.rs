@@ -961,22 +961,6 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     }
 }
 
-fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
-    let status = match event.goal.status {
-        ThreadGoalStatus::Active => "active",
-        ThreadGoalStatus::Paused => "paused",
-        ThreadGoalStatus::BudgetLimited => "budget limited",
-        ThreadGoalStatus::Complete => "complete",
-    };
-
-    let objective = event.goal.objective.trim();
-    if objective.contains('\n') {
-        format!("Goal updated ({status}):\n{objective}")
-    } else {
-        format!("Goal updated ({status}): {objective}")
-    }
-}
-
 enum SubmissionState {
     /// User prompts, including slash commands like /init, /review, /compact.
     Prompt(PromptState),
@@ -1479,7 +1463,6 @@ impl PromptState {
                     "Thread goal updated: thread_id={}, turn_id={:?}, status={:?}",
                     event.thread_id, event.turn_id, event.goal.status
                 );
-                client.send_agent_text(format_thread_goal_update(&event));
                 let ThreadGoalUpdatedEvent {
                     thread_id,
                     turn_id,
@@ -4281,10 +4264,6 @@ impl<A: Auth> ThreadActor<A> {
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
                 self.client.send_agent_thought(text.clone());
             }
-            EventMsg::ThreadGoalUpdated(event) => {
-                self.client
-                    .send_agent_text(format_thread_goal_update(event));
-            }
             // Skip other event types during replay - they either:
             // - Are transient (deltas, turn lifecycle)
             // - Don't have direct ACP equivalents
@@ -5120,7 +5099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_thread_goal_updated_is_sent_as_agent_message() -> anyhow::Result<()> {
+    async fn test_thread_goal_updated_is_sent_as_ext_notification_only() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
@@ -5134,13 +5113,67 @@ mod tests {
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
-        assert!(notifications.iter().any(|notification| {
+        assert!(!notifications.iter().any(|notification| {
             matches!(
                 &notification.update,
                 SessionUpdate::AgentMessageChunk(ContentChunk {
                     content: ContentBlock::Text(TextContent { text, .. }),
                     ..
-                }) if text == "Goal updated (active): Ship the goal update"
+                }) if text.starts_with("Goal updated")
+            )
+        }));
+        drop(notifications);
+
+        let ext_notifications = client.ext_notifications.lock().unwrap();
+        assert_eq!(ext_notifications.len(), 1);
+        assert_eq!(
+            ext_notifications[0].method.as_ref(),
+            "_acp_ext:thread_goal_updated"
+        );
+        let params: serde_json::Value = serde_json::from_str(ext_notifications[0].params.get())?;
+        assert_eq!(params["goal"]["objective"], "Ship the goal update");
+        assert_eq!(params["goal"]["status"], "active");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_thread_goal_updated_does_not_emit_agent_text() -> anyhow::Result<()> {
+        let (_session_id, client, _, message_tx, _handle) = setup().await?;
+        let thread_id = ThreadId::new();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(
+                ThreadGoalUpdatedEvent {
+                    thread_id,
+                    turn_id: Some("turn-1".to_string()),
+                    goal: ThreadGoal {
+                        thread_id,
+                        objective: "keep shipping".to_string(),
+                        status: ThreadGoalStatus::Active,
+                        token_budget: None,
+                        tokens_used: 10,
+                        time_used_seconds: 20,
+                        created_at: 1_000,
+                        updated_at: 2_000,
+                    },
+                },
+            ))],
+            response_tx,
+        })?;
+
+        response_rx.await??;
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(!notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text.starts_with("Goal updated")
             )
         }));
 
