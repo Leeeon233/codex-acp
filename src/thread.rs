@@ -257,7 +257,7 @@ pub struct RaceLimitUpdate {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ThreadGoalPayload {
+pub(crate) struct ThreadGoalPayload {
     thread_id: String,
     objective: String,
     status: ThreadGoalStatus,
@@ -430,6 +430,16 @@ enum ThreadMessage {
         value: SessionConfigOptionValue,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
+    GetThreadGoal {
+        response_tx: oneshot::Sender<Result<Option<ThreadGoal>, Error>>,
+    },
+    SetThreadGoalStatus {
+        status: ThreadGoalStatus,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    ClearThreadGoal {
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
     Cancel {
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
@@ -560,6 +570,42 @@ impl Thread {
             value,
             response_tx,
         };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn get_thread_goal(&self) -> Result<Option<ThreadGoal>, Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::GetThreadGoal { response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn set_thread_goal_status(&self, status: ThreadGoalStatus) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::SetThreadGoalStatus {
+            status,
+            response_tx,
+        };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn clear_thread_goal(&self) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::ClearThreadGoal { response_tx };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -3172,6 +3218,21 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_set_config_option(config_id, value).await;
                 drop(response_tx.send(result));
             }
+            ThreadMessage::GetThreadGoal { response_tx } => {
+                let result = self.get_thread_goal_snapshot().await;
+                drop(response_tx.send(result));
+            }
+            ThreadMessage::SetThreadGoalStatus {
+                status,
+                response_tx,
+            } => {
+                let result = self.set_thread_goal_status_from_client(status).await;
+                drop(response_tx.send(result));
+            }
+            ThreadMessage::ClearThreadGoal { response_tx } => {
+                let result = self.clear_thread_goal_from_client().await;
+                drop(response_tx.send(result));
+            }
             ThreadMessage::Cancel { response_tx } => {
                 let result = self.handle_cancel().await;
                 drop(response_tx.send(result));
@@ -3807,12 +3868,7 @@ impl<A: Auth> ThreadActor<A> {
             ));
         }
 
-        let thread_id = self.thread_id.ok_or_else(|| {
-            Error::internal_error().data("ACP session id is not a valid Codex thread id")
-        })?;
-        let state_db = self.thread.state_db().ok_or_else(|| {
-            Error::internal_error().data("sqlite state db unavailable for thread goals")
-        })?;
+        let (thread_id, state_db) = self.thread_goal_context()?;
 
         let trimmed = args.trim();
         match trimmed.to_ascii_lowercase().as_str() {
@@ -3842,6 +3898,51 @@ impl<A: Auth> ThreadActor<A> {
                     .await
             }
         }
+    }
+
+    fn thread_goal_context(&self) -> Result<(ThreadId, StateDbHandle), Error> {
+        if !self.config.features.enabled(Feature::Goals) {
+            return Err(Error::invalid_params().data(
+                "Thread goals are disabled. Enable the Codex `goals` feature to use goals.",
+            ));
+        }
+
+        let thread_id = self.thread_id.ok_or_else(|| {
+            Error::internal_error().data("ACP session id is not a valid Codex thread id")
+        })?;
+        let state_db = self.thread.state_db().ok_or_else(|| {
+            Error::internal_error().data("sqlite state db unavailable for thread goals")
+        })?;
+
+        Ok((thread_id, state_db))
+    }
+
+    async fn get_thread_goal_snapshot(&self) -> Result<Option<ThreadGoal>, Error> {
+        let (thread_id, state_db) = self.thread_goal_context()?;
+        let goal = state_db
+            .get_thread_goal(thread_id)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        Ok(goal.map(protocol_thread_goal_from_state))
+    }
+
+    async fn set_thread_goal_status_from_client(
+        &mut self,
+        status: ThreadGoalStatus,
+    ) -> Result<(), Error> {
+        let (thread_id, state_db) = self.thread_goal_context()?;
+        let status = state_thread_goal_status_from_protocol(status)?;
+        self.set_thread_goal_status(thread_id, &state_db, status)
+            .await?
+            .map_or(Ok(()), |message| Err(Error::invalid_params().data(message)))
+    }
+
+    async fn clear_thread_goal_from_client(&mut self) -> Result<(), Error> {
+        let (thread_id, state_db) = self.thread_goal_context()?;
+        self.clear_thread_goal(thread_id, &state_db)
+            .await
+            .map(|_| ())
     }
 
     async fn describe_thread_goal(
@@ -3978,9 +4079,10 @@ impl<A: Auth> ThreadActor<A> {
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
+        self.thread.apply_external_goal_clear().await;
+        self.client.send_thread_goal_cleared(&thread_id);
+
         if cleared {
-            self.thread.apply_external_goal_clear().await;
-            self.client.send_thread_goal_cleared(&thread_id);
             Ok(None)
         } else {
             Ok(Some(
@@ -4790,6 +4892,19 @@ fn thread_goal_status_from_state(status: codex_state::ThreadGoalStatus) -> Threa
     }
 }
 
+fn state_thread_goal_status_from_protocol(
+    status: ThreadGoalStatus,
+) -> Result<codex_state::ThreadGoalStatus, Error> {
+    match status {
+        ThreadGoalStatus::Active => Ok(codex_state::ThreadGoalStatus::Active),
+        ThreadGoalStatus::Paused => Ok(codex_state::ThreadGoalStatus::Paused),
+        ThreadGoalStatus::BudgetLimited | ThreadGoalStatus::Complete => {
+            Err(Error::invalid_params()
+                .data("thread/goal/set only supports active or paused status"))
+        }
+    }
+}
+
 fn thread_goal_status_label(status: ThreadGoalStatus) -> &'static str {
     match status {
         ThreadGoalStatus::Active => "active",
@@ -5308,6 +5423,105 @@ mod tests {
         assert_eq!(pause_params["goal"]["status"], "paused");
         assert_eq!(resume_params["goal"]["status"], "active");
         assert_eq!(clear_params["threadId"], thread_id.to_string());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_thread_goal_control_messages_pause_resume_and_idempotent_clear()
+    -> anyhow::Result<()> {
+        let thread_id = ThreadId::new();
+        let session_id = SessionId::new(thread_id.to_string());
+        let state_db = test_state_db(thread_id).await?;
+        state_db
+            .replace_thread_goal(
+                thread_id,
+                "ship the release",
+                codex_state::ThreadGoalStatus::Active,
+                None,
+            )
+            .await?;
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::with_state_db(state_db.clone()));
+        let models_manager = Arc::new(StubModelsManager);
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.features.enable(Feature::Goals)?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+        let _handle = tokio::spawn(actor.spawn());
+
+        let (get_response_tx, get_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::GetThreadGoal {
+            response_tx: get_response_tx,
+        })?;
+        let goal = get_response_rx.await??.expect("goal should exist");
+        assert_eq!(goal.objective, "ship the release");
+        assert_eq!(goal.status, ThreadGoalStatus::Active);
+
+        for status in [ThreadGoalStatus::Paused, ThreadGoalStatus::Active] {
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            message_tx.send(ThreadMessage::SetThreadGoalStatus {
+                status,
+                response_tx,
+            })?;
+            response_rx.await??;
+        }
+
+        for _ in 0..2 {
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            message_tx.send(ThreadMessage::ClearThreadGoal { response_tx })?;
+            response_rx.await??;
+        }
+
+        assert!(state_db.get_thread_goal(thread_id).await?.is_none());
+        assert_eq!(
+            thread.applied_goal_sets.lock().unwrap().as_slice(),
+            &[
+                codex_state::ThreadGoalStatus::Paused,
+                codex_state::ThreadGoalStatus::Active,
+            ]
+        );
+        assert_eq!(
+            thread
+                .applied_goal_clears
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+
+        let ext_notifications = client.ext_notifications.lock().unwrap();
+        assert_eq!(ext_notifications.len(), 4);
+        assert_eq!(
+            ext_notifications[0].method.as_ref(),
+            "_acp_ext:thread_goal_updated"
+        );
+        assert_eq!(
+            ext_notifications[1].method.as_ref(),
+            "_acp_ext:thread_goal_updated"
+        );
+        assert_eq!(
+            ext_notifications[2].method.as_ref(),
+            "_acp_ext:thread_goal_cleared"
+        );
+        assert_eq!(
+            ext_notifications[3].method.as_ref(),
+            "_acp_ext:thread_goal_cleared"
+        );
 
         Ok(())
     }
