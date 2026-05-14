@@ -171,7 +171,7 @@ impl CodexAgent {
         let thread_manager = ThreadManager::new(
             &config,
             auth_manager.clone(),
-            SessionSource::Unknown,
+            SessionSource::Cli,
             environment_manager,
             None,
             thread_store,
