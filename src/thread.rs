@@ -35,14 +35,17 @@ use codex_core::{
 };
 use codex_features::Feature;
 use codex_login::auth::AuthManager;
-use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
+use codex_models_manager::{
+    collaboration_mode_presets::builtin_collaboration_mode_presets,
+    manager::{ModelsManager, RefreshStrategy},
+};
 use codex_protocol::{
     ThreadId,
     approvals::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
     },
-    config_types::TrustLevel,
+    config_types::{CollaborationMode, ModeKind, Settings, TrustLevel},
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     mcp::CallToolResult,
@@ -67,17 +70,18 @@ use codex_protocol::{
         McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
         ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
         PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
-        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
-        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
-        TerminalInteractionEvent, ThreadGoal, ThreadGoalStatus, ThreadGoalUpdatedEvent,
-        TokenCountEvent, TokenUsageInfo, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
-        UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
-        WebSearchEndEvent, validate_thread_goal_objective,
+        PlanDeltaEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
+        RequestUserInputEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget,
+        RolloutItem, StreamErrorEvent, TerminalInteractionEvent, ThreadGoal, ThreadGoalStatus,
+        ThreadGoalUpdatedEvent, TokenCountEvent, TokenUsageInfo, TurnAbortedEvent,
+        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent, validate_thread_goal_objective,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
         RequestPermissionsResponse,
     },
+    request_user_input::RequestUserInputResponse,
     user_input::UserInput,
 };
 use codex_rollout::state_db::StateDbHandle;
@@ -125,10 +129,12 @@ impl ClientSender for AcpConnection {
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const FAST_MODE_CONFIG_ID: &str = "fast_mode";
+const CODEX_PLAN_MODE_CONFIG_ID: &str = "codex_plan_mode";
 const USAGE_METHOD: &str = "acp_ext:session_usage_update";
 const RATE_LIMITS_METHOD: &str = "acp_ext:session_rate_limits";
 const THREAD_GOAL_UPDATED_METHOD: &str = "acp_ext:thread_goal_updated";
 const THREAD_GOAL_CLEARED_METHOD: &str = "acp_ext:thread_goal_cleared";
+const CODEX_PROPOSED_PLAN_METHOD: &str = "acp_ext:codex_proposed_plan";
 
 const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
 const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
@@ -295,6 +301,24 @@ struct ThreadGoalUpdatedNotification {
 #[serde(rename_all = "camelCase")]
 struct ThreadGoalClearedNotification {
     thread_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexProposedPlanNotification {
+    schema_version: u8,
+    session_id: String,
+    turn_id: String,
+    markdown: String,
+    status: CodexProposedPlanStatus,
+    is_latest: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+enum CodexProposedPlanStatus {
+    Delta,
+    Completed,
 }
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
@@ -672,6 +696,9 @@ enum PendingPermissionRequest {
         call_id: String,
         permissions: RequestPermissionProfile,
     },
+    RequestUserInput {
+        turn_id: String,
+    },
     McpElicitation {
         server_name: String,
         request_id: codex_protocol::mcp::RequestId,
@@ -729,11 +756,82 @@ fn permissions_request_key(call_id: &str) -> String {
     format!("permissions:{call_id}")
 }
 
+fn request_user_input_request_key(call_id: &str) -> String {
+    format!("request-user-input:{call_id}")
+}
+
 fn mcp_elicitation_request_key(
     server_name: &str,
     request_id: &codex_protocol::mcp::RequestId,
 ) -> String {
     format!("mcp-elicitation:{server_name}:{request_id}")
+}
+
+fn empty_request_user_input_response() -> RequestUserInputResponse {
+    RequestUserInputResponse {
+        answers: HashMap::new(),
+    }
+}
+
+fn request_user_input_response_from_outcome(
+    outcome: RequestPermissionOutcome,
+) -> RequestUserInputResponse {
+    let RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
+        meta: Some(meta), ..
+    }) = outcome
+    else {
+        return empty_request_user_input_response();
+    };
+
+    let Some(answers) = meta
+        .get("codex")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|codex| codex.get("requestUserInput"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|request_user_input| request_user_input.get("answers"))
+        .cloned()
+    else {
+        return empty_request_user_input_response();
+    };
+
+    serde_json::from_value(serde_json::json!({ "answers": answers }))
+        .unwrap_or_else(|_| empty_request_user_input_response())
+}
+
+fn request_user_input_title(event: &RequestUserInputEvent) -> String {
+    event
+        .questions
+        .iter()
+        .find_map(|question| {
+            let question_text = question.question.trim();
+            if !question_text.is_empty() {
+                return Some(question_text.to_string());
+            }
+            let header = question.header.trim();
+            (!header.is_empty()).then(|| header.to_string())
+        })
+        .unwrap_or_else(|| "Codex question".to_string())
+}
+
+fn request_user_input_content(event: &RequestUserInputEvent) -> String {
+    event
+        .questions
+        .iter()
+        .map(|question| {
+            let mut lines = vec![question.question.clone()];
+            if let Some(options) = &question.options {
+                lines.extend(options.iter().map(|option| {
+                    if option.description.trim().is_empty() {
+                        format!("- {}", option.label)
+                    } else {
+                        format!("- {}: {}", option.label, option.description)
+                    }
+                }));
+            }
+            lines.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 const MCP_TOOL_APPROVAL_KIND_KEY: &str = "codex_approval_kind";
@@ -1048,6 +1146,8 @@ struct PromptState {
     completed: bool,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+    proposed_plan_markdown: String,
+    proposed_plan_turn_id: Option<String>,
 }
 
 impl PromptState {
@@ -1072,6 +1172,8 @@ impl PromptState {
             completed: false,
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            proposed_plan_markdown: String::new(),
+            proposed_plan_turn_id: None,
         }
     }
 
@@ -1095,6 +1197,8 @@ impl PromptState {
             completed: false,
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            proposed_plan_markdown: String::new(),
+            proposed_plan_turn_id: None,
         }
     }
 
@@ -1135,13 +1239,14 @@ impl PromptState {
         pending_request: PendingPermissionRequest,
         tool_call: ToolCallUpdate,
         options: Vec<PermissionOption>,
+        meta: Option<Meta>,
     ) {
         let client = client.clone();
         let resolution_tx = self.resolution_tx.clone();
         let submission_id = self.submission_id.clone();
         let resolved_request_key = request_key.clone();
         let handle = tokio::spawn(async move {
-            let response = client.request_permission(tool_call, options).await;
+            let response = client.request_permission(tool_call, options, meta).await;
             drop(
                 resolution_tx.send(ThreadMessage::PermissionRequestResolved {
                     submission_id,
@@ -1259,6 +1364,17 @@ impl PromptState {
                 self.thread
                     .submit(Op::RequestPermissionsResponse {
                         id: call_id,
+                        response,
+                    })
+                    .await
+                    .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+            }
+            PendingPermissionRequest::RequestUserInput { turn_id } => {
+                let response = request_user_input_response_from_outcome(response.outcome);
+
+                self.thread
+                    .submit(Op::UserInputAnswer {
+                        id: turn_id,
                         response,
                     })
                     .await
@@ -1619,6 +1735,7 @@ impl PromptState {
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
                 );
+                self.complete_proposed_plan(client, turn_id);
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
@@ -1735,6 +1852,17 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            EventMsg::RequestUserInput(event) => {
+                info!("Request user input: {} {}", event.call_id, event.turn_id);
+                if let Err(err) = self.request_user_input(client, event)
+                    && let Some(response_tx) = self.response_tx.take()
+                {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
+            EventMsg::PlanDelta(event) => {
+                self.plan_delta(client, event);
+            }
             EventMsg::GuardianAssessment(event) => {
                 info!(
                     "Guardian assessment: id={}, status={:?}, turn_id={}",
@@ -1767,14 +1895,85 @@ impl PromptState {
             | EventMsg::CollabResumeBegin(..)
             | EventMsg::CollabResumeEnd(..)
             | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..)
-            | EventMsg::PlanDelta(..)=> {}
+            | EventMsg::CollabCloseEnd(..)=> {}
             e @ (EventMsg::RealtimeConversationListVoicesResponse(..)
-            | EventMsg::DeprecationNotice(..)
-            | EventMsg::RequestUserInput(..)) => {
+            | EventMsg::DeprecationNotice(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
+    }
+
+    fn plan_delta(&mut self, client: &SessionClient, event: PlanDeltaEvent) {
+        self.proposed_plan_markdown.push_str(&event.delta);
+        self.proposed_plan_turn_id = Some(event.turn_id.clone());
+        client.send_codex_proposed_plan(
+            event.turn_id,
+            self.proposed_plan_markdown.clone(),
+            CodexProposedPlanStatus::Delta,
+        );
+    }
+
+    fn complete_proposed_plan(&mut self, client: &SessionClient, turn_id: String) {
+        if self.proposed_plan_markdown.trim().is_empty() {
+            return;
+        }
+
+        let proposal_turn_id = self
+            .proposed_plan_turn_id
+            .clone()
+            .unwrap_or_else(|| turn_id.clone());
+        client.send_codex_proposed_plan(
+            proposal_turn_id,
+            self.proposed_plan_markdown.clone(),
+            CodexProposedPlanStatus::Completed,
+        );
+    }
+
+    fn request_user_input(
+        &mut self,
+        client: &SessionClient,
+        event: RequestUserInputEvent,
+    ) -> Result<(), Error> {
+        let raw_input = serde_json::json!(&event);
+        let title = request_user_input_title(&event);
+        let content = request_user_input_content(&event);
+        let call_id = event.call_id.clone();
+        let turn_id = event.turn_id.clone();
+        let questions = event.questions.clone();
+        let request_key = request_user_input_request_key(&call_id);
+        let meta = Meta::from_iter([(
+            "codex".to_string(),
+            serde_json::json!({
+                "requestUserInput": {
+                    "callId": call_id,
+                    "turnId": turn_id,
+                    "questions": questions,
+                }
+            }),
+        )]);
+
+        self.spawn_permission_request(
+            client,
+            request_key,
+            PendingPermissionRequest::RequestUserInput {
+                turn_id: event.turn_id,
+            },
+            ToolCallUpdate::new(
+                event.call_id,
+                ToolCallUpdateFields::new()
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::Pending)
+                    .title(title)
+                    .content(vec![ToolCallContent::Content(Content::new(content))])
+                    .raw_input(raw_input),
+            ),
+            vec![
+                PermissionOption::new("answer", "Answer", PermissionOptionKind::AllowOnce),
+                PermissionOption::new("cancel", "Cancel", PermissionOptionKind::RejectOnce),
+            ],
+            Some(meta),
+        );
+        Ok(())
     }
 
     async fn mcp_elicitation(
@@ -1809,6 +2008,7 @@ impl PromptState {
                 },
                 supported_request.tool_call,
                 supported_request.options,
+                None,
             );
             return Ok(());
         }
@@ -1914,6 +2114,7 @@ impl PromptState {
                     .raw_input(raw_input),
             ),
             options,
+            None,
         );
         Ok(())
     }
@@ -2226,6 +2427,7 @@ impl PromptState {
                 .into_iter()
                 .map(|option| option.permission_option)
                 .collect(),
+            None,
         );
 
         Ok(())
@@ -2624,6 +2826,7 @@ impl PromptState {
                 PermissionOption::new("approved", "Yes", PermissionOptionKind::AllowOnce),
                 PermissionOption::new("abort", "No", PermissionOptionKind::RejectOnce),
             ],
+            None,
         );
 
         Ok(())
@@ -2980,6 +3183,25 @@ impl SessionClient {
         );
     }
 
+    fn send_codex_proposed_plan(
+        &self,
+        turn_id: String,
+        markdown: String,
+        status: CodexProposedPlanStatus,
+    ) {
+        self.send_json_ext_notification(
+            CODEX_PROPOSED_PLAN_METHOD,
+            &CodexProposedPlanNotification {
+                schema_version: 1,
+                session_id: self.session_id.to_string(),
+                turn_id,
+                markdown,
+                status,
+                is_latest: true,
+            },
+        );
+    }
+
     fn send_user_message(&self, text: impl Into<String>) {
         self.send_notification(SessionUpdate::UserMessageChunk(ContentChunk::new(
             text.into().into(),
@@ -3058,13 +3280,13 @@ impl SessionClient {
         &self,
         tool_call: ToolCallUpdate,
         options: Vec<PermissionOption>,
+        meta: Option<Meta>,
     ) -> Result<RequestPermissionResponse, Error> {
         self.client
-            .request_permission(RequestPermissionRequest::new(
-                self.session_id.clone(),
-                tool_call,
-                options,
-            ))
+            .request_permission(
+                RequestPermissionRequest::new(self.session_id.clone(), tool_call, options)
+                    .meta(meta),
+            )
             .await
     }
 }
@@ -3092,6 +3314,8 @@ struct ThreadActor<A> {
     resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
+    /// Codex collaboration Plan Mode is independent from ACP approval/sandbox mode.
+    codex_plan_mode_enabled: bool,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -3119,6 +3343,7 @@ impl<A: Auth> ThreadActor<A> {
             message_rx,
             resolution_rx,
             last_sent_config_options: None,
+            codex_plan_mode_enabled: false,
         }
     }
 
@@ -3199,7 +3424,11 @@ impl<A: Auth> ThreadActor<A> {
                 response_tx,
             } => {
                 let result = self.handle_set_config_option(config_id, value).await;
+                let should_emit_config_options = result.is_ok();
                 drop(response_tx.send(result));
+                if should_emit_config_options {
+                    self.maybe_emit_config_options_update().await;
+                }
             }
             ThreadMessage::GetThreadGoal { response_tx } => {
                 let result = self.get_thread_goal_snapshot().await;
@@ -3409,6 +3638,18 @@ impl<A: Auth> ThreadActor<A> {
             .description("Use the fastest inference tier for future turns"),
         );
 
+        options.push(
+            SessionConfigOption::boolean(
+                CODEX_PLAN_MODE_CONFIG_ID,
+                "Plan Mode",
+                self.codex_plan_mode_enabled,
+            )
+            .category(SessionConfigOptionCategory::Other(
+                "_codex_plan_mode".to_string(),
+            ))
+            .description("Plan without modifying files; switch off to implement the approved plan"),
+        );
+
         // Reasoning effort selector (only if the current preset exists and has >1 supported effort)
         if let Some(preset) = current_preset
             && preset.supported_reasoning_efforts.len() > 1
@@ -3481,6 +3722,12 @@ impl<A: Auth> ThreadActor<A> {
             };
             return self.handle_set_fast_mode(value).await;
         }
+        if config_id.0.as_ref() == CODEX_PLAN_MODE_CONFIG_ID {
+            let SessionConfigOptionValue::Boolean { value } = value else {
+                return Err(Error::invalid_params().data("Plan Mode expects a boolean value"));
+            };
+            return self.handle_set_codex_plan_mode(value).await;
+        }
 
         let SessionConfigOptionValue::ValueId { value } = value else {
             return Err(Error::invalid_params().data("Unsupported config option value"));
@@ -3518,6 +3765,36 @@ impl<A: Auth> ThreadActor<A> {
 
         self.config.service_tier = service_tier;
 
+        Ok(())
+    }
+
+    async fn handle_set_codex_plan_mode(&mut self, enabled: bool) -> Result<(), Error> {
+        let mode = if enabled {
+            ModeKind::Plan
+        } else {
+            ModeKind::Default
+        };
+        let collaboration_mode = self.codex_collaboration_mode(mode).await;
+
+        self.thread
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                permission_profile: None,
+                sandbox_policy: None,
+                model: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: Some(collaboration_mode),
+                personality: None,
+                windows_sandbox_level: None,
+                service_tier: None,
+                approvals_reviewer: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.codex_plan_mode_enabled = enabled;
         Ok(())
     }
 
@@ -4124,6 +4401,23 @@ impl<A: Auth> ThreadActor<A> {
 
     async fn get_current_model(&self) -> String {
         self.models_manager.get_model(&self.config.model).await
+    }
+
+    async fn codex_collaboration_mode(&self, mode: ModeKind) -> CollaborationMode {
+        let base = CollaborationMode {
+            mode: ModeKind::Default,
+            settings: Settings {
+                model: self.get_current_model().await,
+                reasoning_effort: self.config.model_reasoning_effort,
+                developer_instructions: None,
+            },
+        };
+
+        builtin_collaboration_mode_presets()
+            .iter()
+            .find(|preset| preset.mode == Some(mode))
+            .map(|preset| base.apply_mask(preset))
+            .unwrap_or(base)
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
@@ -5066,6 +5360,9 @@ mod tests {
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::request_user_input::{
+        RequestUserInputQuestion, RequestUserInputQuestionOption,
+    };
     use codex_protocol::{ThreadId, protocol::ThreadGoal};
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
@@ -5094,6 +5391,258 @@ mod tests {
                 ..
             }) if text == "Hi"
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_codex_plan_mode_config_switches_collaboration_mode() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client, Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+
+        let option = actor
+            .config_options()
+            .await?
+            .into_iter()
+            .find(|option| option.id.0.as_ref() == CODEX_PLAN_MODE_CONFIG_ID)
+            .expect("Plan Mode config option should be present");
+        let option_json = serde_json::to_value(&option)?;
+        assert_eq!(option_json["type"], "boolean");
+        assert_eq!(option_json["currentValue"], false);
+        assert_eq!(option_json["category"], "_codex_plan_mode");
+
+        actor
+            .handle_set_config_option(
+                SessionConfigId::new(CODEX_PLAN_MODE_CONFIG_ID),
+                SessionConfigOptionValue::Boolean { value: true },
+            )
+            .await?;
+
+        assert_eq!(
+            actor
+                .config_options()
+                .await?
+                .into_iter()
+                .find(|option| option.id.0.as_ref() == CODEX_PLAN_MODE_CONFIG_ID)
+                .map(|option| serde_json::to_value(&option).unwrap()["currentValue"].clone()),
+            Some(serde_json::json!(true))
+        );
+
+        {
+            let ops = thread.ops.lock().unwrap();
+            assert!(matches!(
+                ops.last(),
+                Some(Op::OverrideTurnContext {
+                    collaboration_mode: Some(mode),
+                    ..
+                }) if mode.mode == ModeKind::Plan
+            ));
+        }
+
+        actor
+            .handle_set_config_option(
+                SessionConfigId::new(CODEX_PLAN_MODE_CONFIG_ID),
+                SessionConfigOptionValue::Boolean { value: false },
+            )
+            .await?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::OverrideTurnContext {
+                collaboration_mode: Some(mode),
+                ..
+            }) if mode.mode == ModeKind::Default
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_user_input_routes_to_dynamic_permission_request() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let response_meta = Meta::from_iter([(
+            "codex".to_string(),
+            serde_json::json!({
+                "requestUserInput": {
+                    "answers": {
+                        "next_step": {
+                            "answers": ["Start implementation"]
+                        }
+                    }
+                }
+            }),
+        )]);
+        let client = Arc::new(StubClient::with_permission_responses(vec![
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("answer").meta(response_meta),
+            )),
+        ]));
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread.clone(),
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state.request_user_input(
+            &session_client,
+            RequestUserInputEvent {
+                call_id: "call-ask".to_string(),
+                turn_id: "turn-ask".to_string(),
+                questions: vec![RequestUserInputQuestion {
+                    id: "next_step".to_string(),
+                    header: "Next step".to_string(),
+                    question: "How should I proceed with this plan?".to_string(),
+                    is_other: true,
+                    is_secret: false,
+                    options: Some(vec![
+                        RequestUserInputQuestionOption {
+                            label: "Tighten the plan first".to_string(),
+                            description: "Review edge cases before implementation".to_string(),
+                        },
+                        RequestUserInputQuestionOption {
+                            label: "Start implementation".to_string(),
+                            description: "Use the current proposal".to_string(),
+                        },
+                    ]),
+                }],
+            },
+        )?;
+
+        let ThreadMessage::PermissionRequestResolved {
+            submission_id,
+            request_key,
+            response,
+        } = message_rx.recv().await.unwrap()
+        else {
+            panic!("expected permission resolution message");
+        };
+        assert_eq!(submission_id, "submission-id");
+
+        {
+            let requests = client.permission_requests.lock().unwrap();
+            let request = requests.last().unwrap();
+            assert_eq!(request.tool_call.tool_call_id.0.as_ref(), "call-ask");
+            assert_eq!(
+                request
+                    .options
+                    .iter()
+                    .map(|option| option.option_id.0.to_string())
+                    .collect::<Vec<_>>(),
+                vec!["answer", "cancel"]
+            );
+            assert_eq!(
+                request.meta.as_ref().unwrap()["codex"]["requestUserInput"]["questions"][0]["options"]
+                    [1]["label"],
+                "Start implementation"
+            );
+        }
+
+        prompt_state
+            .handle_permission_request_resolved(&session_client, request_key, response)
+            .await?;
+
+        let op = thread.ops.lock().unwrap().last().cloned().unwrap();
+        match op {
+            Op::UserInputAnswer { id, response } => {
+                assert_eq!(id, "turn-ask");
+                assert_eq!(
+                    response.answers["next_step"].answers,
+                    vec!["Start implementation".to_string()]
+                );
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_delta_emits_proposed_plan_notifications() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state =
+            PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::PlanDelta(PlanDeltaEvent {
+                    thread_id: "thread".to_string(),
+                    turn_id: "turn-plan".to_string(),
+                    item_id: "item-plan".to_string(),
+                    delta: "- Inspect the parser\n".to_string(),
+                }),
+            )
+            .await;
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::PlanDelta(PlanDeltaEvent {
+                    thread_id: "thread".to_string(),
+                    turn_id: "turn-plan".to_string(),
+                    item_id: "item-plan".to_string(),
+                    delta: "- Reuse the existing UI\n".to_string(),
+                }),
+            )
+            .await;
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    last_agent_message: None,
+                    turn_id: "turn-plan".to_string(),
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                }),
+            )
+            .await;
+
+        let ext_notifications = client.ext_notifications.lock().unwrap();
+        assert_eq!(ext_notifications.len(), 3);
+        assert_eq!(
+            ext_notifications[0].method.as_ref(),
+            "_acp_ext:codex_proposed_plan"
+        );
+        let delta: serde_json::Value = serde_json::from_str(ext_notifications[1].params.get())?;
+        assert_eq!(delta["status"], "delta");
+        assert_eq!(
+            delta["markdown"],
+            "- Inspect the parser\n- Reuse the existing UI\n"
+        );
+        let completed: serde_json::Value = serde_json::from_str(ext_notifications[2].params.get())?;
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["turnId"], "turn-plan");
 
         Ok(())
     }
@@ -6551,7 +7100,9 @@ mod tests {
                     }
                     Op::ExecApproval { .. }
                     | Op::ResolveElicitation { .. }
+                    | Op::OverrideTurnContext { .. }
                     | Op::RequestPermissionsResponse { .. }
+                    | Op::UserInputAnswer { .. }
                     | Op::PatchApproval { .. }
                     | Op::Interrupt => {}
                     Op::Shutdown => {
