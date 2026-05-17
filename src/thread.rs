@@ -5448,15 +5448,16 @@ mod tests {
             Some(serde_json::json!(true))
         );
 
-        let ops = thread.ops.lock().unwrap();
-        assert!(matches!(
-            ops.last(),
-            Some(Op::OverrideTurnContext {
-                collaboration_mode: Some(mode),
-                ..
-            }) if mode.mode == ModeKind::Plan
-        ));
-        drop(ops);
+        {
+            let ops = thread.ops.lock().unwrap();
+            assert!(matches!(
+                ops.last(),
+                Some(Op::OverrideTurnContext {
+                    collaboration_mode: Some(mode),
+                    ..
+                }) if mode.mode == ModeKind::Plan
+            ));
+        }
 
         actor
             .handle_set_config_option(
