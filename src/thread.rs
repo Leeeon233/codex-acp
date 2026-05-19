@@ -135,8 +135,6 @@ const RATE_LIMITS_METHOD: &str = "acp_ext:session_rate_limits";
 const THREAD_GOAL_UPDATED_METHOD: &str = "acp_ext:thread_goal_updated";
 const THREAD_GOAL_CLEARED_METHOD: &str = "acp_ext:thread_goal_cleared";
 const CODEX_PROPOSED_PLAN_METHOD: &str = "acp_ext:codex_proposed_plan";
-const PROPOSED_PLAN_OPEN_TAG: &str = "<proposed_plan>";
-const PROPOSED_PLAN_CLOSE_TAG: &str = "</proposed_plan>";
 
 const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
 const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
@@ -1150,17 +1148,6 @@ struct PromptState {
     seen_reasoning_deltas: bool,
     proposed_plan_markdown: String,
     proposed_plan_turn_id: Option<String>,
-    proposed_plan_tag_buffer: String,
-    inside_proposed_plan_tag: bool,
-}
-
-fn complete_prefix_len_preserving_partial_tag(buffer: &str, tag: &str) -> usize {
-    for len in (1..tag.len()).rev() {
-        if buffer.ends_with(&tag[..len]) {
-            return buffer.len() - len;
-        }
-    }
-    buffer.len()
 }
 
 impl PromptState {
@@ -1187,8 +1174,6 @@ impl PromptState {
             seen_reasoning_deltas: false,
             proposed_plan_markdown: String::new(),
             proposed_plan_turn_id: None,
-            proposed_plan_tag_buffer: String::new(),
-            inside_proposed_plan_tag: false,
         }
     }
 
@@ -1214,8 +1199,6 @@ impl PromptState {
             seen_reasoning_deltas: false,
             proposed_plan_markdown: String::new(),
             proposed_plan_turn_id: None,
-            proposed_plan_tag_buffer: String::new(),
-            inside_proposed_plan_tag: false,
         }
     }
 
@@ -1548,7 +1531,7 @@ impl PromptState {
             }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
-                self.agent_message_text(client, turn_id, delta);
+                client.send_agent_text(delta);
             }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
                 thread_id,
@@ -1581,9 +1564,7 @@ impl PromptState {
                 info!("Agent message (non-delta) received: {message:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
-                    let turn_id = self.submission_id.clone();
-                    self.agent_message_text(client, turn_id.clone(), message);
-                    self.flush_pending_agent_message_text(client, turn_id);
+                    client.send_agent_text(message);
                 }
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
@@ -1754,7 +1735,6 @@ impl PromptState {
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
                 );
-                self.flush_pending_agent_message_text(client, turn_id.clone());
                 self.complete_proposed_plan(client, turn_id);
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
@@ -1923,90 +1903,14 @@ impl PromptState {
         }
     }
 
-    fn agent_message_text(&mut self, client: &SessionClient, turn_id: String, text: String) {
-        let (visible_text, proposed_plan_delta) = self.extract_proposed_plan_text(&text);
-        if !visible_text.is_empty() {
-            client.send_agent_text(visible_text);
-        }
-        if !proposed_plan_delta.is_empty() {
-            self.proposed_plan_delta(client, turn_id, proposed_plan_delta);
-        }
-    }
-
-    fn extract_proposed_plan_text(&mut self, text: &str) -> (String, String) {
-        self.proposed_plan_tag_buffer.push_str(text);
-        let mut visible_text = String::new();
-        let mut proposed_plan_delta = String::new();
-
-        loop {
-            if self.inside_proposed_plan_tag {
-                if let Some(end) = self.proposed_plan_tag_buffer.find(PROPOSED_PLAN_CLOSE_TAG) {
-                    proposed_plan_delta.push_str(&self.proposed_plan_tag_buffer[..end]);
-                    self.proposed_plan_tag_buffer
-                        .drain(..end + PROPOSED_PLAN_CLOSE_TAG.len());
-                    self.inside_proposed_plan_tag = false;
-                    continue;
-                }
-
-                let split_at = complete_prefix_len_preserving_partial_tag(
-                    &self.proposed_plan_tag_buffer,
-                    PROPOSED_PLAN_CLOSE_TAG,
-                );
-                if split_at > 0 {
-                    proposed_plan_delta.push_str(&self.proposed_plan_tag_buffer[..split_at]);
-                    self.proposed_plan_tag_buffer.drain(..split_at);
-                }
-                break;
-            }
-
-            if let Some(start) = self.proposed_plan_tag_buffer.find(PROPOSED_PLAN_OPEN_TAG) {
-                visible_text.push_str(&self.proposed_plan_tag_buffer[..start]);
-                self.proposed_plan_tag_buffer
-                    .drain(..start + PROPOSED_PLAN_OPEN_TAG.len());
-                self.inside_proposed_plan_tag = true;
-                continue;
-            }
-
-            let split_at = complete_prefix_len_preserving_partial_tag(
-                &self.proposed_plan_tag_buffer,
-                PROPOSED_PLAN_OPEN_TAG,
-            );
-            if split_at > 0 {
-                visible_text.push_str(&self.proposed_plan_tag_buffer[..split_at]);
-                self.proposed_plan_tag_buffer.drain(..split_at);
-            }
-            break;
-        }
-
-        (visible_text, proposed_plan_delta)
-    }
-
-    fn flush_pending_agent_message_text(&mut self, client: &SessionClient, turn_id: String) {
-        if self.proposed_plan_tag_buffer.is_empty() {
-            return;
-        }
-
-        let pending = std::mem::take(&mut self.proposed_plan_tag_buffer);
-        if self.inside_proposed_plan_tag {
-            self.inside_proposed_plan_tag = false;
-            self.proposed_plan_delta(client, turn_id, pending);
-        } else {
-            client.send_agent_text(pending);
-        }
-    }
-
-    fn proposed_plan_delta(&mut self, client: &SessionClient, turn_id: String, delta: String) {
-        self.proposed_plan_markdown.push_str(&delta);
-        self.proposed_plan_turn_id = Some(turn_id.clone());
+    fn plan_delta(&mut self, client: &SessionClient, event: PlanDeltaEvent) {
+        self.proposed_plan_markdown.push_str(&event.delta);
+        self.proposed_plan_turn_id = Some(event.turn_id.clone());
         client.send_codex_proposed_plan(
-            turn_id,
+            event.turn_id,
             self.proposed_plan_markdown.clone(),
             CodexProposedPlanStatus::Delta,
         );
-    }
-
-    fn plan_delta(&mut self, client: &SessionClient, event: PlanDeltaEvent) {
-        self.proposed_plan_delta(client, event.turn_id, event.delta);
     }
 
     fn complete_proposed_plan(&mut self, client: &SessionClient, turn_id: String) {
@@ -5744,8 +5648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_agent_message_proposed_plan_tags_emit_proposed_plan_notifications()
-    -> anyhow::Result<()> {
+    async fn test_agent_message_proposed_plan_tags_remain_agent_text() -> anyhow::Result<()> {
         let session_id = SessionId::new("test");
         let client = Arc::new(StubClient::new());
         let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
@@ -5798,27 +5701,13 @@ mod tests {
                 _ => None,
             })
             .collect::<String>();
-        assert_eq!(visible_text, "Before\n\nAfter");
-        assert!(!visible_text.contains("proposed_plan"));
+        assert_eq!(
+            visible_text,
+            "Before\n<proposed_plan>- Inspect the parser\n- Reuse the existing UI\n</proposed_plan>\nAfter"
+        );
 
         let ext_notifications = client.ext_notifications.lock().unwrap();
-        assert_eq!(ext_notifications.len(), 3);
-        let first_delta: serde_json::Value =
-            serde_json::from_str(ext_notifications[0].params.get())?;
-        assert_eq!(first_delta["status"], "delta");
-        assert_eq!(first_delta["markdown"], "- Inspect the parser\n");
-        let second_delta: serde_json::Value =
-            serde_json::from_str(ext_notifications[1].params.get())?;
-        assert_eq!(
-            second_delta["markdown"],
-            "- Inspect the parser\n- Reuse the existing UI\n"
-        );
-        let completed: serde_json::Value = serde_json::from_str(ext_notifications[2].params.get())?;
-        assert_eq!(completed["status"], "completed");
-        assert_eq!(
-            completed["markdown"],
-            "- Inspect the parser\n- Reuse the existing UI\n"
-        );
+        assert!(ext_notifications.is_empty());
 
         Ok(())
     }
