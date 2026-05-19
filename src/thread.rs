@@ -5648,6 +5648,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_agent_message_proposed_plan_tags_remain_agent_text() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state =
+            PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+
+        for delta in [
+            "Before\n<proposed_",
+            "plan>- Inspect the parser\n",
+            "- Reuse the existing UI\n</proposed_plan>\nAfter",
+        ] {
+            prompt_state
+                .handle_event(
+                    &session_client,
+                    EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                        thread_id: "thread".to_string(),
+                        turn_id: "turn-plan".to_string(),
+                        item_id: "item-plan".to_string(),
+                        delta: delta.to_string(),
+                    }),
+                )
+                .await;
+        }
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    last_agent_message: None,
+                    turn_id: "turn-plan".to_string(),
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                }),
+            )
+            .await;
+
+        let visible_text = client
+            .notifications
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(
+            visible_text,
+            "Before\n<proposed_plan>- Inspect the parser\n- Reuse the existing UI\n</proposed_plan>\nAfter"
+        );
+
+        let ext_notifications = client.ext_notifications.lock().unwrap();
+        assert!(ext_notifications.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_thread_goal_updated_is_sent_as_ext_notification_only() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
