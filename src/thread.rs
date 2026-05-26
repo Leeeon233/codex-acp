@@ -73,9 +73,10 @@ use codex_protocol::{
         PlanDeltaEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
         RequestUserInputEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget,
         RolloutItem, StreamErrorEvent, TerminalInteractionEvent, ThreadGoal, ThreadGoalStatus,
-        ThreadGoalUpdatedEvent, TokenCountEvent, TokenUsageInfo, TurnAbortedEvent,
-        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
-        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent, validate_thread_goal_objective,
+        ThreadGoalUpdatedEvent, ThreadSettingsOverrides, TokenCountEvent, TokenUsageInfo,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        validate_thread_goal_objective,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -182,7 +183,7 @@ fn untrusted_read_only_mode_id(config: &Config) -> Option<SessionModeId> {
 }
 
 fn semantic_session_mode_id_for_permission_profile(config: &Config) -> Option<&'static str> {
-    let permission_profile = config.permissions.permission_profile.get();
+    let permission_profile = config.permissions.permission_profile();
 
     match permission_profile {
         PermissionProfile::Managed { .. } => {
@@ -218,7 +219,7 @@ fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
 
     if let Some(preset) = APPROVAL_PRESETS.iter().find(|preset| {
         approval_matches_current_config(preset, config)
-            && &preset.permission_profile == config.permissions.permission_profile.get()
+            && &preset.permission_profile == config.permissions.permission_profile()
     }) {
         return Some(SessionModeId::new(preset.id));
     }
@@ -476,6 +477,7 @@ enum ThreadMessage {
     },
     PermissionRequestResolved {
         submission_id: String,
+        interaction_id: u64,
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
     },
@@ -707,8 +709,8 @@ enum PendingPermissionRequest {
 }
 
 struct PendingPermissionInteraction {
+    id: u64,
     request: PendingPermissionRequest,
-    task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone)]
@@ -1080,22 +1082,28 @@ impl SubmissionState {
     async fn handle_permission_request_resolved(
         &mut self,
         client: &SessionClient,
+        interaction_id: u64,
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
     ) -> Result<(), Error> {
         match self {
             Self::Prompt(state) => {
                 state
-                    .handle_permission_request_resolved(client, request_key, response)
+                    .handle_permission_request_resolved(
+                        client,
+                        interaction_id,
+                        request_key,
+                        response,
+                    )
                     .await
             }
         }
     }
 
-    fn abort_pending_interactions(&mut self) {
+    fn detach_pending_interactions(&mut self) {
         match self {
             Self::Prompt(state) => {
-                state.abort_pending_interactions();
+                state.detach_pending_interactions();
             }
         }
     }
@@ -1140,6 +1148,7 @@ struct PromptState {
     thread: Arc<dyn CodexThreadImpl>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
+    next_permission_interaction_id: u64,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     goal_background: bool,
@@ -1166,6 +1175,7 @@ impl PromptState {
             thread,
             resolution_tx,
             pending_permission_interactions: HashMap::new(),
+            next_permission_interaction_id: 0,
             event_count: 0,
             response_tx: Some(response_tx),
             goal_background: false,
@@ -1191,6 +1201,7 @@ impl PromptState {
             thread,
             resolution_tx,
             pending_permission_interactions: HashMap::new(),
+            next_permission_interaction_id: 0,
             event_count: 0,
             response_tx: None,
             goal_background: true,
@@ -1226,10 +1237,10 @@ impl PromptState {
         Ok(())
     }
 
-    fn abort_pending_interactions(&mut self) {
-        for (_, interaction) in self.pending_permission_interactions.drain() {
-            interaction.task.abort();
-        }
+    fn detach_pending_interactions(&mut self) {
+        // Keep detached permission request tasks running so ACP can route the
+        // client's required `Cancelled` response after session cancellation.
+        self.pending_permission_interactions.clear();
     }
 
     fn spawn_permission_request(
@@ -1241,38 +1252,54 @@ impl PromptState {
         options: Vec<PermissionOption>,
         meta: Option<Meta>,
     ) {
+        let interaction_id = self.next_permission_interaction_id;
+        self.next_permission_interaction_id = self.next_permission_interaction_id.wrapping_add(1);
         let client = client.clone();
         let resolution_tx = self.resolution_tx.clone();
         let submission_id = self.submission_id.clone();
         let resolved_request_key = request_key.clone();
-        let handle = tokio::spawn(async move {
+        drop(tokio::spawn(async move {
             let response = client.request_permission(tool_call, options, meta).await;
             drop(
                 resolution_tx.send(ThreadMessage::PermissionRequestResolved {
                     submission_id,
+                    interaction_id,
                     request_key: resolved_request_key,
                     response,
                 }),
             );
-        });
+        }));
 
-        if let Some(interaction) = self.pending_permission_interactions.insert(
+        self.pending_permission_interactions.insert(
             request_key,
             PendingPermissionInteraction {
+                id: interaction_id,
                 request: pending_request,
-                task: handle,
             },
-        ) {
-            interaction.task.abort();
-        }
+        );
     }
 
     async fn handle_permission_request_resolved(
         &mut self,
         _client: &SessionClient,
+        interaction_id: u64,
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
     ) -> Result<(), Error> {
+        let Some(pending_interaction_id) = self
+            .pending_permission_interactions
+            .get(&request_key)
+            .map(|interaction| interaction.id)
+        else {
+            warn!("Ignoring permission response for unknown request key: {request_key}");
+            return Ok(());
+        };
+
+        if pending_interaction_id != interaction_id {
+            warn!("Ignoring stale permission response for request key: {request_key}");
+            return Ok(());
+        }
+
         let Some(interaction) = self.pending_permission_interactions.remove(&request_key) else {
             warn!("Ignoring permission response for unknown request key: {request_key}");
             return Ok(());
@@ -1520,6 +1547,7 @@ impl PromptState {
                 images: _,
                 text_elements: _,
                 local_images: _,
+                ..
             }) => {
                 info!("User message: {message:?}");
             }
@@ -1668,7 +1696,8 @@ impl PromptState {
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id,
                 invocation,
-                mcp_app_resource_uri: _
+                mcp_app_resource_uri: _,
+                ..
             }) => {
                 info!(
                     "MCP tool call begin: call_id={call_id}, invocation={} {}",
@@ -1682,6 +1711,7 @@ impl PromptState {
                 duration,
                 result,
                 mcp_app_resource_uri: _,
+                ..
             }) => {
                 info!(
                     "MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}",
@@ -1736,7 +1766,7 @@ impl PromptState {
                     self.event_count
                 );
                 self.complete_proposed_plan(client, turn_id);
-                self.abort_pending_interactions();
+                self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
@@ -1756,7 +1786,7 @@ impl PromptState {
                 codex_error_info,
             }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
-                self.abort_pending_interactions();
+                self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx
                         .send(Err(Error::internal_error().data(
@@ -1768,7 +1798,7 @@ impl PromptState {
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
-                self.abort_pending_interactions();
+                self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
@@ -1776,7 +1806,7 @@ impl PromptState {
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
-                self.abort_pending_interactions();
+                self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
@@ -1877,7 +1907,7 @@ impl PromptState {
             | EventMsg::HookCompleted(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
-            | EventMsg::SkillsUpdateAvailable
+            | EventMsg::ThreadSettingsApplied(..)
             // Old events
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
@@ -2082,6 +2112,7 @@ impl PromptState {
             // grant_root doesn't seem to be set anywhere on the codex side
             grant_root: _,
             turn_id: _,
+            ..
         } = event;
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
         let request_key = patch_request_key(&call_id);
@@ -2331,6 +2362,7 @@ impl PromptState {
             additional_permissions,
             available_decisions: _,
             proposed_network_policy_amendments,
+            ..
         } = event;
 
         // Create a new tool call for the command execution
@@ -2608,8 +2640,8 @@ impl PromptState {
         let stdin = format!("\n{stdin}\n");
         // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
         if let Some(active_command) = self.active_commands.get_mut(&call_id) {
-            let update = if client.supports_terminal_output(active_command) {
-                ToolCallUpdate::new(
+            if client.supports_terminal_output(active_command) {
+                let update = ToolCallUpdate::new(
                     active_command.tool_call_id.clone(),
                     ToolCallUpdateFields::new(),
                 )
@@ -2619,27 +2651,15 @@ impl PromptState {
                         "terminal_id": call_id,
                         "data": stdin
                     }),
-                )]))
+                )]));
+                client.send_tool_call_update(update);
             } else {
+                // Fallback path: accumulate stdin into the active command buffer and
+                // defer emission to exec_command_end. Emitting per stdin event would
+                // re-send the entire output+stdin buffer each time and reintroduce the
+                // O(N²) growth fixed in the delta path.
                 active_command.output.push_str(&stdin);
-                let content = match active_command.file_extension.as_deref() {
-                    Some("md") => active_command.output.clone(),
-                    Some(ext) => format!(
-                        "```{ext}\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                    None => format!(
-                        "```sh\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                };
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new().content(vec![content.into()]),
-                )
-            };
-
-            client.send_tool_call_update(update);
+            }
         }
     }
 
@@ -2751,6 +2771,7 @@ impl PromptState {
             reason,
             permissions,
             cwd: _,
+            ..
         } = event;
 
         // Create a new tool call for the command execution
@@ -2784,7 +2805,7 @@ impl PromptState {
                 file_system
                     .entries
                     .iter()
-                    .filter(|entry| entry.access == FileSystemAccessMode::None),
+                    .filter(|entry| entry.access == FileSystemAccessMode::Deny),
             );
             if !denies.is_empty() {
                 content.push(format!("File System Denied Access: {denies}"));
@@ -3462,6 +3483,7 @@ impl<A: Auth> ThreadActor<A> {
             }
             ThreadMessage::PermissionRequestResolved {
                 submission_id,
+                interaction_id,
                 request_key,
                 response,
             } => {
@@ -3473,10 +3495,15 @@ impl<A: Auth> ThreadActor<A> {
                 };
 
                 if let Err(err) = submission
-                    .handle_permission_request_resolved(&self.client, request_key, response)
+                    .handle_permission_request_resolved(
+                        &self.client,
+                        interaction_id,
+                        request_key,
+                        response,
+                    )
                     .await
                 {
-                    submission.abort_pending_interactions();
+                    submission.detach_pending_interactions();
                     submission.fail(err);
                 }
             }
@@ -3746,19 +3773,11 @@ impl<A: Auth> ThreadActor<A> {
             .map(|t| t.request_value().to_string());
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                permission_profile: None,
-                sandbox_policy: None,
-                model: None,
-                effort: None,
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-                windows_sandbox_level: None,
-                service_tier: Some(service_tier.clone()),
-                approvals_reviewer: None,
+            .submit(Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    service_tier: Some(service_tier.clone()),
+                    ..Default::default()
+                },
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3777,19 +3796,11 @@ impl<A: Auth> ThreadActor<A> {
         let collaboration_mode = self.codex_collaboration_mode(mode).await;
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                permission_profile: None,
-                sandbox_policy: None,
-                model: None,
-                effort: None,
-                summary: None,
-                collaboration_mode: Some(collaboration_mode),
-                personality: None,
-                windows_sandbox_level: None,
-                service_tier: None,
-                approvals_reviewer: None,
+            .submit(Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    collaboration_mode: Some(collaboration_mode),
+                    ..Default::default()
+                },
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3830,19 +3841,12 @@ impl<A: Auth> ThreadActor<A> {
         };
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                model: Some(model_to_use.clone()),
-                effort: Some(effort_to_use),
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-                windows_sandbox_level: None,
-                service_tier: None,
-                approvals_reviewer: None,
-                permission_profile: None,
+            .submit(Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    model: Some(model_to_use.clone()),
+                    effort: Some(effort_to_use),
+                    ..Default::default()
+                },
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3878,19 +3882,11 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                model: None,
-                effort: Some(Some(effort)),
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-                windows_sandbox_level: None,
-                service_tier: None,
-                approvals_reviewer: None,
-                permission_profile: None,
+            .submit(Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    effort: Some(Some(effort)),
+                    ..Default::default()
+                },
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3954,7 +3950,7 @@ impl<A: Auth> ThreadActor<A> {
             return;
         };
 
-        match state_db.get_thread_goal(thread_id).await {
+        match state_db.thread_goals().get_thread_goal(thread_id).await {
             Ok(Some(goal)) => {
                 let goal = protocol_thread_goal_from_state(goal);
                 self.client
@@ -3987,6 +3983,7 @@ impl<A: Auth> ThreadActor<A> {
                         final_output_json_schema: None,
                         environments: None,
                         responsesapi_client_metadata: None,
+                        thread_settings: Default::default(),
                     }
                 }
                 "review" => {
@@ -4046,6 +4043,7 @@ impl<A: Auth> ThreadActor<A> {
                         final_output_json_schema: None,
                         environments: None,
                         responsesapi_client_metadata: None,
+                        thread_settings: Default::default(),
                     }
                 }
             }
@@ -4055,6 +4053,7 @@ impl<A: Auth> ThreadActor<A> {
                 final_output_json_schema: None,
                 environments: None,
                 responsesapi_client_metadata: None,
+                thread_settings: Default::default(),
             }
         }
 
@@ -4180,6 +4179,7 @@ impl<A: Auth> ThreadActor<A> {
     async fn get_thread_goal_snapshot(&self) -> Result<Option<ThreadGoal>, Error> {
         let (thread_id, state_db) = self.thread_goal_context()?;
         let goal = state_db
+            .thread_goals()
             .get_thread_goal(thread_id)
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -4211,6 +4211,7 @@ impl<A: Auth> ThreadActor<A> {
         state_db: &StateDbHandle,
     ) -> Result<String, Error> {
         let goal = state_db
+            .thread_goals()
             .get_thread_goal(thread_id)
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -4231,6 +4232,7 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|message| Error::invalid_params().data(message))?;
 
         let previous = state_db
+            .thread_goals()
             .get_thread_goal(thread_id)
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -4241,11 +4243,13 @@ impl<A: Auth> ThreadActor<A> {
                 goal.objective == objective
                     && goal.status != codex_state::ThreadGoalStatus::Complete
             }) {
-            let previous_status = ExternalGoalPreviousStatus::Existing(previous_goal.status);
+            let previous_status = ExternalGoalPreviousStatus::from(previous_goal);
             let goal = state_db
+                .thread_goals()
                 .update_thread_goal(
                     thread_id,
-                    codex_state::ThreadGoalUpdate {
+                    codex_state::GoalUpdate {
+                        objective: None,
                         status: Some(codex_state::ThreadGoalStatus::Active),
                         token_budget: None,
                         expected_goal_id: Some(previous_goal.goal_id.clone()),
@@ -4257,6 +4261,7 @@ impl<A: Auth> ThreadActor<A> {
             (goal, previous_status)
         } else {
             let goal = state_db
+                .thread_goals()
                 .replace_thread_goal(
                     thread_id,
                     objective,
@@ -4287,6 +4292,7 @@ impl<A: Auth> ThreadActor<A> {
         status: codex_state::ThreadGoalStatus,
     ) -> Result<Option<String>, Error> {
         let existing = state_db
+            .thread_goals()
             .get_thread_goal(thread_id)
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -4295,13 +4301,15 @@ impl<A: Auth> ThreadActor<A> {
                 "No goal is currently set. Use `/goal <objective>` to create one.".to_string(),
             ));
         };
-        let previous_status = ExternalGoalPreviousStatus::Existing(existing.status);
+        let previous_status = ExternalGoalPreviousStatus::from(&existing);
 
         self.thread.prepare_external_goal_mutation().await;
         let goal = state_db
+            .thread_goals()
             .update_thread_goal(
                 thread_id,
-                codex_state::ThreadGoalUpdate {
+                codex_state::GoalUpdate {
+                    objective: None,
                     status: Some(status),
                     token_budget: None,
                     expected_goal_id: Some(existing.goal_id.clone()),
@@ -4335,6 +4343,7 @@ impl<A: Auth> ThreadActor<A> {
     ) -> Result<Option<String>, Error> {
         self.thread.prepare_external_goal_mutation().await;
         let cleared = state_db
+            .thread_goals()
             .delete_thread_goal(thread_id)
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -4358,19 +4367,14 @@ impl<A: Auth> ThreadActor<A> {
             .ok_or_else(Error::invalid_params)?;
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: Some(preset.approval),
-                permission_profile: Some(preset.permission_profile.clone()),
-                sandbox_policy: None,
-                model: None,
-                effort: None,
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-                windows_sandbox_level: None,
-                service_tier: None,
-                approvals_reviewer: None,
+            .submit(Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    approval_policy: Some(preset.approval),
+                    permission_profile: Some(preset.permission_profile.clone()),
+                    active_permission_profile: active_profile_id_for_session_mode(preset.id)
+                        .map(ActivePermissionProfile::new),
+                    ..Default::default()
+                },
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -4382,10 +4386,7 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         self.config
             .permissions
-            .set_permission_profile_with_active_profile(
-                preset.permission_profile.clone(),
-                active_profile_id_for_session_mode(preset.id).map(ActivePermissionProfile::new),
-            )
+            .set_permission_profile(preset.permission_profile.clone())
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         if mode_trusts_project(preset.id) {
@@ -4439,19 +4440,12 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                model: Some(model_to_use.clone()),
-                effort: Some(effort_to_use),
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-                windows_sandbox_level: None,
-                service_tier: None,
-                approvals_reviewer: None,
-                permission_profile: None,
+            .submit(Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    model: Some(model_to_use.clone()),
+                    effort: Some(effort_to_use),
+                    ..Default::default()
+                },
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -4463,7 +4457,7 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_cancel(&mut self) -> Result<(), Error> {
-        self.abort_pending_interactions();
+        self.detach_pending_interactions();
         self.thread
             .submit(Op::Interrupt)
             .await
@@ -4472,7 +4466,7 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_shutdown(&mut self) -> Result<(), Error> {
-        self.abort_pending_interactions();
+        self.detach_pending_interactions();
         self.thread
             .submit(Op::Shutdown)
             .await
@@ -4480,9 +4474,9 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
-    fn abort_pending_interactions(&mut self) {
+    fn detach_pending_interactions(&mut self) {
         for submission in self.submissions.values_mut() {
-            submission.abort_pending_interactions();
+            submission.detach_pending_interactions();
         }
     }
 
@@ -4506,7 +4500,7 @@ impl<A: Auth> ThreadActor<A> {
         let Some(state_db) = self.thread.state_db() else {
             return false;
         };
-        match state_db.get_thread_goal(thread_id).await {
+        match state_db.thread_goals().get_thread_goal(thread_id).await {
             Ok(Some(goal)) => goal.status == codex_state::ThreadGoalStatus::Active,
             Ok(None) => false,
             Err(err) => {
@@ -4557,6 +4551,13 @@ impl<A: Auth> ThreadActor<A> {
             }
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
                 self.client.send_agent_thought(text.clone());
+            }
+            EventMsg::ThreadGoalUpdated(event) => {
+                self.client.send_thread_goal_updated(
+                    &event.thread_id,
+                    event.turn_id.clone(),
+                    &event.goal,
+                );
             }
             // Skip other event types during replay - they either:
             // - Are transient (deltas, turn lifecycle)
@@ -4893,6 +4894,7 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
             }),
             ContentBlock::Image(image_block) => Some(UserInput::Image {
                 image_url: format!("data:{};base64,{}", image_block.mime_type, image_block.data),
+                detail: None,
             }),
             ContentBlock::ResourceLink(ResourceLink { name, uri, .. }) => Some(UserInput::Text {
                 text: format_uri_as_link(Some(name), uri),
@@ -5160,6 +5162,8 @@ fn thread_goal_status_from_state(status: codex_state::ThreadGoalStatus) -> Threa
     match status {
         codex_state::ThreadGoalStatus::Active => ThreadGoalStatus::Active,
         codex_state::ThreadGoalStatus::Paused => ThreadGoalStatus::Paused,
+        codex_state::ThreadGoalStatus::Blocked => ThreadGoalStatus::Blocked,
+        codex_state::ThreadGoalStatus::UsageLimited => ThreadGoalStatus::UsageLimited,
         codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
         codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
     }
@@ -5171,10 +5175,10 @@ fn state_thread_goal_status_from_protocol(
     match status {
         ThreadGoalStatus::Active => Ok(codex_state::ThreadGoalStatus::Active),
         ThreadGoalStatus::Paused => Ok(codex_state::ThreadGoalStatus::Paused),
-        ThreadGoalStatus::BudgetLimited | ThreadGoalStatus::Complete => {
-            Err(Error::invalid_params()
-                .data("thread/goal/set only supports active or paused status"))
-        }
+        ThreadGoalStatus::Blocked => Ok(codex_state::ThreadGoalStatus::Blocked),
+        ThreadGoalStatus::UsageLimited => Ok(codex_state::ThreadGoalStatus::UsageLimited),
+        ThreadGoalStatus::BudgetLimited => Ok(codex_state::ThreadGoalStatus::BudgetLimited),
+        ThreadGoalStatus::Complete => Ok(codex_state::ThreadGoalStatus::Complete),
     }
 }
 
@@ -5182,6 +5186,8 @@ fn thread_goal_status_label(status: ThreadGoalStatus) -> &'static str {
     match status {
         ThreadGoalStatus::Active => "active",
         ThreadGoalStatus::Paused => "paused",
+        ThreadGoalStatus::Blocked => "blocked",
+        ThreadGoalStatus::UsageLimited => "usage-limited",
         ThreadGoalStatus::BudgetLimited => "budget-limited",
         ThreadGoalStatus::Complete => "complete",
     }
@@ -5452,10 +5458,11 @@ mod tests {
             let ops = thread.ops.lock().unwrap();
             assert!(matches!(
                 ops.last(),
-                Some(Op::OverrideTurnContext {
-                    collaboration_mode: Some(mode),
-                    ..
-                }) if mode.mode == ModeKind::Plan
+                Some(Op::ThreadSettings { thread_settings })
+                    if thread_settings
+                        .collaboration_mode
+                        .as_ref()
+                        .is_some_and(|mode| mode.mode == ModeKind::Plan)
             ));
         }
 
@@ -5469,10 +5476,11 @@ mod tests {
         let ops = thread.ops.lock().unwrap();
         assert!(matches!(
             ops.last(),
-            Some(Op::OverrideTurnContext {
-                collaboration_mode: Some(mode),
-                ..
-            }) if mode.mode == ModeKind::Default
+            Some(Op::ThreadSettings { thread_settings })
+                if thread_settings
+                    .collaboration_mode
+                    .as_ref()
+                    .is_some_and(|mode| mode.mode == ModeKind::Default)
         ));
 
         Ok(())
@@ -5536,6 +5544,7 @@ mod tests {
 
         let ThreadMessage::PermissionRequestResolved {
             submission_id,
+            interaction_id,
             request_key,
             response,
         } = message_rx.recv().await.unwrap()
@@ -5564,7 +5573,12 @@ mod tests {
         }
 
         prompt_state
-            .handle_permission_request_resolved(&session_client, request_key, response)
+            .handle_permission_request_resolved(
+                &session_client,
+                interaction_id,
+                request_key,
+                response,
+            )
             .await?;
 
         let op = thread.ops.lock().unwrap().last().cloned().unwrap();
@@ -5943,6 +5957,7 @@ mod tests {
         assert_eq!(stop_reason, StopReason::EndTurn);
 
         let goal = state_db
+            .thread_goals()
             .get_thread_goal(thread_id)
             .await?
             .expect("goal should be set");
@@ -5987,6 +6002,7 @@ mod tests {
         let session_id = SessionId::new(thread_id.to_string());
         let state_db = test_state_db(thread_id).await?;
         state_db
+            .thread_goals()
             .replace_thread_goal(
                 thread_id,
                 "ship the release",
@@ -6028,7 +6044,13 @@ mod tests {
             assert_eq!(prompt_response_rx.await??.await??, StopReason::EndTurn);
         }
 
-        assert!(state_db.get_thread_goal(thread_id).await?.is_none());
+        assert!(
+            state_db
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await?
+                .is_none()
+        );
         assert_eq!(
             thread.applied_goal_sets.lock().unwrap().as_slice(),
             &[
@@ -6081,6 +6103,7 @@ mod tests {
         let session_id = SessionId::new(thread_id.to_string());
         let state_db = test_state_db(thread_id).await?;
         state_db
+            .thread_goals()
             .replace_thread_goal(
                 thread_id,
                 "ship the release",
@@ -6136,7 +6159,13 @@ mod tests {
             response_rx.await??;
         }
 
-        assert!(state_db.get_thread_goal(thread_id).await?.is_none());
+        assert!(
+            state_db
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await?
+                .is_none()
+        );
         assert_eq!(
             thread.applied_goal_sets.lock().unwrap().as_slice(),
             &[
@@ -6229,6 +6258,7 @@ mod tests {
         let session_id = SessionId::new(thread_id.to_string());
         let state_db = test_state_db(thread_id).await?;
         state_db
+            .thread_goals()
             .replace_thread_goal(
                 thread_id,
                 "ship the release",
@@ -6322,6 +6352,7 @@ mod tests {
         let session_id = SessionId::new(thread_id.to_string());
         let state_db = test_state_db(thread_id).await?;
         state_db
+            .thread_goals()
             .replace_thread_goal(
                 thread_id,
                 "ship the release",
@@ -6437,10 +6468,7 @@ mod tests {
 
         config
             .permissions
-            .set_permission_profile_with_active_profile(
-                augmented_profile,
-                Some(ActivePermissionProfile::new(CODEX_WORKSPACE_PROFILE_ID)),
-            )?;
+            .set_permission_profile(augmented_profile)?;
 
         let mode_id = current_session_mode_id(&config).expect("mode should be recognized");
         assert_eq!(mode_id.0.as_ref(), "auto");
@@ -6525,6 +6553,7 @@ mod tests {
                 final_output_json_schema: None,
                 environments: None,
                 responsesapi_client_metadata: None,
+                thread_settings: Default::default(),
             }],
             "ops don't match {ops:?}"
         );
@@ -7036,6 +7065,7 @@ mod tests {
                                         call_id: "call-id".to_string(),
                                         approval_id: Some("approval-id".to_string()),
                                         turn_id: id.to_string(),
+                                        started_at_ms: 0,
                                         command: vec!["echo".to_string(), "hi".to_string()],
                                         cwd: std::env::current_dir().unwrap().try_into().unwrap(),
                                         reason: None,
@@ -7165,7 +7195,7 @@ mod tests {
                     }
                     Op::ExecApproval { .. }
                     | Op::ResolveElicitation { .. }
-                    | Op::OverrideTurnContext { .. }
+                    | Op::ThreadSettings { .. }
                     | Op::RequestPermissionsResponse { .. }
                     | Op::UserInputAnswer { .. }
                     | Op::PatchApproval { .. }
@@ -7432,6 +7462,7 @@ mod tests {
                 call_id: "call-id".to_string(),
                 approval_id: Some("approval-id".to_string()),
                 turn_id: "turn-id".to_string(),
+                started_at_ms: 0,
                 command: vec!["echo".to_string(), "hi".to_string()],
                 cwd: std::env::current_dir()?.try_into()?,
                 reason: None,
@@ -7448,6 +7479,7 @@ mod tests {
 
         let ThreadMessage::PermissionRequestResolved {
             submission_id,
+            interaction_id,
             request_key,
             response,
         } = message_rx.recv().await.unwrap()
@@ -7456,7 +7488,12 @@ mod tests {
         };
         assert_eq!(submission_id, "submission-id");
         prompt_state
-            .handle_permission_request_resolved(&session_client, request_key, response)
+            .handle_permission_request_resolved(
+                &session_client,
+                interaction_id,
+                request_key,
+                response,
+            )
             .await?;
 
         let requests = client.permission_requests.lock().unwrap();
@@ -7536,6 +7573,7 @@ mod tests {
 
         let ThreadMessage::PermissionRequestResolved {
             submission_id,
+            interaction_id,
             request_key,
             response,
         } = message_rx.recv().await.unwrap()
@@ -7564,7 +7602,12 @@ mod tests {
         }
 
         prompt_state
-            .handle_permission_request_resolved(&session_client, request_key, response)
+            .handle_permission_request_resolved(
+                &session_client,
+                interaction_id,
+                request_key,
+                response,
+            )
             .await?;
 
         let op = thread.ops.lock().unwrap().last().cloned().unwrap();
@@ -7657,9 +7700,10 @@ mod tests {
     #[tokio::test]
     async fn test_blocked_approval_does_not_block_followup_events() -> anyhow::Result<()> {
         let session_id = SessionId::new("test");
+        let notify = Arc::new(Notify::new());
         let client = Arc::new(StubClient::with_blocked_permission_requests(
             vec![],
-            Arc::new(Notify::new()),
+            notify.clone(),
         ));
         let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
         let thread = Arc::new(StubCodexThread::new());
@@ -7675,6 +7719,7 @@ mod tests {
                     call_id: "call-id".to_string(),
                     approval_id: Some("approval-id".to_string()),
                     turn_id: "turn-id".to_string(),
+                    started_at_ms: 0,
                     command: vec!["echo".to_string(), "hi".to_string()],
                     cwd: std::env::current_dir()?.try_into()?,
                     reason: None,
@@ -7716,7 +7761,99 @@ mod tests {
         }));
 
         drop(notifications);
-        prompt_state.abort_pending_interactions();
+        prompt_state.detach_pending_interactions();
+        notify.notify_one();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_detached_permission_request_drains_late_response() -> anyhow::Result<()> {
+        let notify = Arc::new(Notify::new());
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_blocked_permission_requests(
+            vec![RequestPermissionResponse::new(
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("approved")),
+            )],
+            notify.clone(),
+        ));
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread.clone(),
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                    call_id: "call-id".to_string(),
+                    approval_id: Some("approval-id".to_string()),
+                    turn_id: "turn-id".to_string(),
+                    started_at_ms: 0,
+                    command: vec!["echo".to_string(), "hi".to_string()],
+                    cwd: std::env::current_dir()?.try_into()?,
+                    reason: None,
+                    network_approval_context: None,
+                    proposed_execpolicy_amendment: None,
+                    proposed_network_policy_amendments: None,
+                    additional_permissions: None,
+                    available_decisions: Some(vec![
+                        ReviewDecision::Approved,
+                        ReviewDecision::Abort,
+                    ]),
+                    parsed_cmd: vec![ParsedCommand::Unknown {
+                        cmd: "echo hi".to_string(),
+                    }],
+                }),
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if !client.permission_requests.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        prompt_state.detach_pending_interactions();
+        notify.notify_one();
+
+        let ThreadMessage::PermissionRequestResolved {
+            submission_id,
+            interaction_id,
+            request_key,
+            response,
+        } = tokio::time::timeout(Duration::from_millis(100), message_rx.recv())
+            .await?
+            .expect("permission response should be drained")
+        else {
+            panic!("expected permission resolution message");
+        };
+        assert_eq!(submission_id, "submission-id");
+
+        prompt_state
+            .handle_permission_request_resolved(
+                &session_client,
+                interaction_id,
+                request_key,
+                response,
+            )
+            .await?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            ops.is_empty(),
+            "late permission response should not submit an approval: {ops:?}"
+        );
 
         Ok(())
     }
@@ -7724,11 +7861,12 @@ mod tests {
     #[tokio::test]
     async fn test_thread_shutdown_bypasses_blocked_permission_request() -> anyhow::Result<()> {
         let session_id = SessionId::new("test");
+        let notify = Arc::new(Notify::new());
         let client = Arc::new(StubClient::with_blocked_permission_requests(
             vec![RequestPermissionResponse::new(
                 RequestPermissionOutcome::Cancelled,
             )],
-            Arc::new(Notify::new()),
+            notify.clone(),
         ));
         let session_client =
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
@@ -7780,6 +7918,7 @@ mod tests {
         let stop_reason =
             tokio::time::timeout(Duration::from_millis(100), stop_reason_rx).await??;
         assert_eq!(stop_reason?, StopReason::Cancelled);
+        notify.notify_one();
 
         let ops = conversation.ops.lock().unwrap();
         assert!(matches!(ops.last(), Some(Op::Shutdown)));

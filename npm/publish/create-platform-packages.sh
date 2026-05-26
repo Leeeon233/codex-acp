@@ -70,6 +70,16 @@ for entry in "${platforms[@]}"; do
     tar xzf "$archive_path" -C "${pkg_dir}/bin/" "acp-extension-codex${ext}"
   fi
 
+  if [[ "$os" == "linux" ]]; then
+    if tar tzf "$archive_path" | grep -qx "codex-resources/bwrap"; then
+      tar xzf "$archive_path" -C "${pkg_dir}" "codex-resources/bwrap"
+      chmod +x "${pkg_dir}/codex-resources/bwrap"
+    else
+      echo "Missing bundled bwrap in Linux archive: $archive_path" >&2
+      exit 1
+    fi
+  fi
+
   # Make binary executable (important for Unix-like systems)
   if [[ "$os" != "win32" ]]; then
     chmod 755 "${pkg_dir}/bin/acp-extension-codex${ext}"
