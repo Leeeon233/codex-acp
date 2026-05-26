@@ -24,6 +24,7 @@
   ],
   "files": [
     "bin",
+    "codex-resources",
     "ensure-executable.mjs"
   ]
 }

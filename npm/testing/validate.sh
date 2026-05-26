@@ -56,6 +56,13 @@ if [ $missing_placeholders -eq 0 ]; then
 else
   exit 1
 fi
+
+if grep -q '"codex-resources"' npm/template/package.json; then
+  echo -e "${GREEN}✓ Template includes codex-resources for bundled Linux bwrap${NC}"
+else
+  echo -e "${RED}✗ Template missing codex-resources in files list${NC}"
+  exit 1
+fi
 echo
 
 # 4. Check version consistency
